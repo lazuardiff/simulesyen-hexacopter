@@ -95,7 +95,7 @@ class Control:
     
     def __init__(self, quad, yawType):
         self.sDesCalc = np.zeros(16)
-        self.w_cmd = np.ones(4)*quad.params["w_hover"]
+        self.w_cmd = np.ones(6)*quad.params["w_hover"]
         self.thr_int = np.zeros(3)
         if (yawType == 0):
             att_P_gain[2] = 0
