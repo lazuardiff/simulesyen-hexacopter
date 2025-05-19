@@ -21,9 +21,22 @@ class IMUSensor:
         self.dt = 1.0/self.freq
         
     def measure(self, quad, t):
-        # Get true values from quadcopter model
-        acc_true = quad.acc  # True acceleration in body frame
-        omega_true = quad.omega  # True angular velocity in body frame
+        # Get acceleration in inertial frame
+        acc_inertial = quad.acc
+        
+        # Convert acceleration to body frame
+        R = quad.dcm  # Rotation matrix from body to inertial
+        acc_body_without_gravity = R.T @ acc_inertial
+        
+        # Add gravity effect in body frame (for NED)
+        gravity_ned = np.array([0, 0, 9.81])  # Gravitasi dalam NED
+        gravity_body = R.T @ gravity_ned      # Transformasi ke body frame
+        
+        # Accelerometer mengukur specific force (percepatan + gravitasi)
+        acc_true = acc_body_without_gravity + gravity_body
+        
+        # Gyroscope measure is already correct (angular velocity in body frame)
+        omega_true = quad.omega
         
         # Add noise and bias
         acc_noise = np.random.normal(0, self.acc_noise_std, 3)

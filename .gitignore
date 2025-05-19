@@ -43,3 +43,5 @@ Gifs/Raw/
 .Trashes
 ehthumbs.db
 Thumbs.db
+/logs
+Simulation/logs/
