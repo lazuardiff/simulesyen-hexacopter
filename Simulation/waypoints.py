@@ -12,22 +12,30 @@ import config
 
 deg2rad = pi/180.0
 
+
 def makeWaypoints():
-    
-    v_average = 1.6
+    v_average = 1.2
+    t_ini = 2
 
-    t_ini = 3
-    t = np.array([2, 0, 2, 0])
-    
-    wp_ini = np.array([0, 0, 0])
-    wp = np.array([[2, 2, 1],
-                   [-2, 3, -3],
-                   [-2, -1, -3],
-                   [3, -2, 1],
-                   wp_ini])
+    # Buat 8 titik melingkar
+    radius = 2
+    num_points = 8
+    angles = np.linspace(0, 2*np.pi, num_points, endpoint=False)
 
-    yaw_ini = 0    
-    yaw = np.array([20, -90, 120, 45])
+    wp_ini = np.array([0, 0, 0])  # Mulai dari ketinggian 1 meter
+    wp = np.zeros((num_points, 3))
+
+    for i in range(num_points):
+        wp[i] = [radius * np.cos(angles[i]), radius * np.sin(angles[i]), 1]
+
+    # Waktu di setiap waypoint (tidak berhenti)
+    t = np.ones(num_points) * 1.0
+
+    # Arahkan yaw ke arah gerakan
+    yaw_ini = 0
+    yaw = np.zeros(num_points)
+    for i in range(num_points):
+        yaw[i] = np.degrees(angles[i]) + 90  # Hadapkan ke arah gerakan
 
     t = np.hstack((t_ini, t)).astype(float)
     wp = np.vstack((wp_ini, wp)).astype(float)
