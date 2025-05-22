@@ -18,7 +18,7 @@ def makeWaypoints():
     t_ini = 2
 
     # Buat 8 titik melingkar
-    radius = 2
+    radius = 8
     num_points = 8
     angles = np.linspace(0, 2*np.pi, num_points, endpoint=False)
 

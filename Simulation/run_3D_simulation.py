@@ -19,7 +19,6 @@ from ctrl import Control
 from quadFiles.hexacopter import Quadcopter
 from utils.windModel import Wind
 from utils.SensorModels import IMUSensor, GPSSensor, AltitudeSensor
-from utils.EKF import EKF
 import utils
 import config
 
@@ -54,7 +53,7 @@ def main():
     # ---------------------------
     Ti = 0
     Ts = 0.001
-    Tf = 20
+    Tf = 41
     ifsave = 0
 
     # Choose trajectory settings
@@ -207,36 +206,6 @@ def main():
         'yaw': euler_all[:, 2]
     })
 
-    # sensor data
-    imu_df = pd.DataFrame({
-        'timestamp': t_all,
-        'acc_x': acc_all[:, 0],
-        'acc_y': acc_all[:, 1],
-        'acc_z': acc_all[:, 2],
-        'gyro_x': gyro_all[:, 0],
-        'gyro_y': gyro_all[:, 1],
-        'gyro_z': gyro_all[:, 2]
-    })
-
-    # gps data
-    gps_df = pd.DataFrame({
-        'timestamp': t_all,
-        'pos_x': gps_pos_all[:, 0],
-        'pos_y': gps_pos_all[:, 1],
-        'pos_z': gps_pos_all[:, 2],
-        'vel_x': gps_vel_all[:, 0],
-        'vel_y': gps_vel_all[:, 1],
-        'vel_z': gps_vel_all[:, 2],
-        'available': gps_available
-    })
-
-    # baro data
-    baro_df = pd.DataFrame({
-        'timestamp': t_all,
-        'altitude': baro_alt_all,
-        'available': baro_available
-    })
-
     # Save combined sensor data
     sensor_df = pd.DataFrame({
         'timestamp': t_all,
@@ -281,23 +250,14 @@ def main():
     # Define file paths with timestamp
     ground_truth_file = os.path.join(
         log_dir, f"ground_truth_data_{timestamp}.csv")
-    imu_file = os.path.join(log_dir, f"imu_data_{timestamp}.csv")
-    gps_file = os.path.join(log_dir, f"gps_data_{timestamp}.csv")
-    baro_file = os.path.join(log_dir, f"baro_data_{timestamp}.csv")
     all_sensor_file = os.path.join(log_dir, f"all_sensor_data_{timestamp}.csv")
 
     # Save dataframes to CSV with timestamped filenames in logs directory
     ground_truth_data.to_csv(ground_truth_file, index=False)
-    imu_df.to_csv(imu_file, index=False)
-    gps_df.to_csv(gps_file, index=False)
-    baro_df.to_csv(baro_file, index=False)
     sensor_df.to_csv(all_sensor_file, index=False)
 
     print("Data saved successfully to CSV files:")
     print(f"- {ground_truth_file}")
-    print(f"- {imu_file}")
-    print(f"- {gps_file}")
-    print(f"- {baro_file}")
     print(f"- {all_sensor_file}")
 
     # Add simulation parameters to a metadata file
