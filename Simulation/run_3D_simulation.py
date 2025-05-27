@@ -18,12 +18,12 @@ from trajectory import Trajectory
 from ctrl import Control
 from quadFiles.hexacopter import Quadcopter
 from utils.windModel import Wind
-from utils.SensorModels import IMUSensor, GPSSensor, AltitudeSensor
+from utils.SensorModels import IMUSensor, GPSSensor, AltitudeSensor, MagnetometerSensor
 import utils
 import config
 
 
-def quad_sim(t, Ts, quad, ctrl, wind, traj, imu, gps, alti):
+def quad_sim(t, Ts, quad, ctrl, wind, traj, imu, gps, alti, mag):
 
     # Dynamics (using last timestep's commands)
     # ---------------------------
@@ -34,6 +34,7 @@ def quad_sim(t, Ts, quad, ctrl, wind, traj, imu, gps, alti):
     acc_m, gyro_m = imu.measure(quad, t)
     pos_m, vel_m = gps.measure(quad, t)
     alt_m = alti.measure(quad, t)
+    mag_m = mag.measure(quad, t)
 
     # Trajectory for Desired States
     # ---------------------------
@@ -43,7 +44,7 @@ def quad_sim(t, Ts, quad, ctrl, wind, traj, imu, gps, alti):
     # ---------------------------
     ctrl.controller(traj, quad, sDes, Ts)
 
-    return t, acc_m, gyro_m, pos_m, vel_m, alt_m
+    return t, acc_m, gyro_m, pos_m, vel_m, alt_m, mag_m
 
 
 def main():
@@ -127,6 +128,7 @@ def main():
     gps = GPSSensor()
     baro = AltitudeSensor("baro")
     lidar = AltitudeSensor("lidar")
+    mag = MagnetometerSensor()  # Initialize magnetometer
 
     # Initialize arrays for sensor data
     acc_all = np.zeros([numTimeStep, 3])
@@ -134,9 +136,12 @@ def main():
     gps_pos_all = np.zeros([numTimeStep, 3])
     gps_vel_all = np.zeros([numTimeStep, 3])
     baro_alt_all = np.zeros(numTimeStep)
+    mag_all = np.zeros([numTimeStep, 3])  # Magnetometer data array
 
     gps_available = np.zeros(numTimeStep, dtype=bool)
     baro_available = np.zeros(numTimeStep, dtype=bool)
+    # Magnetometer availability
+    mag_available = np.zeros(numTimeStep, dtype=bool)
 
     # Store initial state
     t_all[0] = Ti
@@ -151,8 +156,8 @@ def main():
     i = 1
     while round(t, 3) < Tf:
 
-        t, acc_m, gyro_m, pos_m, vel_m, alt_m = quad_sim(
-            t, Ts, quad, ctrl, wind, traj, imu, gps, baro)
+        t, acc_m, gyro_m, pos_m, vel_m, alt_m, mag_m = quad_sim(
+            t, Ts, quad, ctrl, wind, traj, imu, gps, baro, mag)
 
         t_all[i] = t
         s_all[i, :] = quad.state
@@ -178,6 +183,9 @@ def main():
         if alt_m is not None:
             baro_alt_all[i] = alt_m
             baro_available[i] = True
+        if mag_m is not None:
+            mag_all[i] = mag_m
+            mag_available[i] = True
 
         i += 1
 
@@ -227,6 +235,11 @@ def main():
         # Barometer
         'baro_altitude': baro_alt_all,
         'baro_available': baro_available,
+        # Magnetometer
+        'mag_x': mag_all[:, 0],
+        'mag_y': mag_all[:, 1],
+        'mag_z': mag_all[:, 2],
+        'mag_available': mag_available,
         # Ground truth
         'true_pos_x': pos_all[:, 0],
         'true_pos_y': pos_all[:, 1],
@@ -272,6 +285,11 @@ def main():
         f.write(f"Yaw trajectory type: {int(trajSelect[1])}\n")
         f.write(f"Waypoint timing mode: {int(trajSelect[2])}\n")
         f.write(f"Total simulation points: {numTimeStep}\n")
+        f.write(f"\nSensor frequencies:\n")
+        f.write(f"IMU: {imu.freq} Hz\n")
+        f.write(f"GPS: {gps.freq} Hz\n")
+        f.write(f"Barometer: {baro.freq} Hz\n")
+        f.write(f"Magnetometer: {mag.freq} Hz\n")
 
     print(f"- {metadata_file}")
 
@@ -284,7 +302,7 @@ def main():
     ani = utils.sameAxisAnimation(t_all, traj.wps, pos_all, quat_all,
                                   sDes_traj_all, Ts, quad.params, traj.xyzType, traj.yawType, ifsave)
     plot_sensor_data(t_all, pos_all, vel_all, acc_all, gyro_all,
-                     gps_pos_all, gps_vel_all, baro_alt_all)
+                     gps_pos_all, gps_vel_all, baro_alt_all, mag_all)
     plt.show()
 
 
@@ -385,7 +403,7 @@ def plot_ekf_results(t_all, pos_all, vel_all, euler_all, pos_est_all, vel_est_al
     plt.tight_layout(rect=[0, 0, 1, 0.95])
 
 
-def plot_sensor_data(t_all, pos_all, vel_all, acc_all, gyro_all, gps_pos_all, gps_vel_all, baro_alt_all):
+def plot_sensor_data(t_all, pos_all, vel_all, acc_all, gyro_all, gps_pos_all, gps_vel_all, baro_alt_all, mag_all):
     # Plot data IMU
     plt.figure(figsize=(15, 10))
     plt.suptitle("IMU Sensor Data", fontsize=16)
@@ -482,6 +500,40 @@ def plot_sensor_data(t_all, pos_all, vel_all, acc_all, gyro_all, gps_pos_all, gp
     plt.xlabel('Time (s)')
     plt.ylabel('Altitude (m)')
     plt.title('Barometer Measurements vs True Altitude')
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+    # Plot magnetometer data
+    plt.figure(figsize=(15, 10))
+    plt.suptitle("Magnetometer Data", fontsize=16)
+
+    # Plot magnetometer measurements
+    plt.subplot(2, 1, 1)
+    # Find non-zero magnetometer readings
+    non_zero_mag = np.where(np.any(mag_all != 0, axis=1))[0]
+
+    plt.plot(t_all[non_zero_mag], mag_all[non_zero_mag, 0],
+             'r.', markersize=2, label='Mag X')
+    plt.plot(t_all[non_zero_mag], mag_all[non_zero_mag, 1],
+             'g.', markersize=2, label='Mag Y')
+    plt.plot(t_all[non_zero_mag], mag_all[non_zero_mag, 2],
+             'b.', markersize=2, label='Mag Z')
+    plt.grid(True)
+    plt.legend()
+    plt.ylabel('Magnetic Field (Gauss)')
+    plt.title('Magnetometer Measurements')
+
+    # Plot magnitude of magnetic field
+    plt.subplot(2, 1, 2)
+    mag_magnitude = np.sqrt(mag_all[non_zero_mag, 0]**2 +
+                            mag_all[non_zero_mag, 1]**2 +
+                            mag_all[non_zero_mag, 2]**2)
+    plt.plot(t_all[non_zero_mag], mag_magnitude, 'k-', label='Magnitude')
+    plt.grid(True)
+    plt.legend()
+    plt.xlabel('Time (s)')
+    plt.ylabel('Magnetic Field Magnitude (Gauss)')
+    plt.title('Magnetometer Magnitude')
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
 
