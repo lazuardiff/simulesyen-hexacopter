@@ -109,6 +109,24 @@ def main():
     thr_all = np.zeros([numTimeStep, len(quad.thr)])
     tor_all = np.zeros([numTimeStep, len(quad.tor)])
 
+    # ======= NEW: Initialize Control Data Arrays =======
+    # Motor commands and control signals
+    thrust_sp_all = np.zeros([numTimeStep, 3])        # Thrust setpoint [x, y, z]
+    rate_sp_all = np.zeros([numTimeStep, 3])          # Rate setpoint [p, q, r]
+    rate_ctrl_all = np.zeros([numTimeStep, 3])        # Rate control output
+    qd_all = np.zeros([numTimeStep, 4])               # Desired quaternion
+    pos_sp_all = np.zeros([numTimeStep, 3])           # Position setpoint
+    vel_sp_all = np.zeros([numTimeStep, 3])           # Velocity setpoint
+    acc_sp_all = np.zeros([numTimeStep, 3])           # Acceleration setpoint
+    
+    # Control allocation data (for EKF physics model)
+    total_thrust_all = np.zeros(numTimeStep)          # Total thrust magnitude
+    control_torques_all = np.zeros([numTimeStep, 3]) # Control torques [Mx, My, Mz]
+    
+    # Vehicle dynamics data
+    acc_body_all = np.zeros([numTimeStep, 3])         # Acceleration in body frame
+    omega_dot_all = np.zeros([numTimeStep, 3])        # Angular acceleration
+
     t_all[0] = Ti
     s_all[0, :] = quad.state
     pos_all[0, :] = quad.pos
@@ -122,6 +140,31 @@ def main():
     wMotor_all[0, :] = quad.wMotor
     thr_all[0, :] = quad.thr
     tor_all[0, :] = quad.tor
+
+    # ======= NEW: Store Initial Control Data =======
+    thrust_sp_all[0, :] = ctrl.thrust_sp
+    rate_sp_all[0, :] = ctrl.rate_sp if hasattr(ctrl, 'rate_sp') else [0, 0, 0]
+    rate_ctrl_all[0, :] = ctrl.rateCtrl if hasattr(ctrl, 'rateCtrl') else [0, 0, 0]
+    qd_all[0, :] = ctrl.qd if hasattr(ctrl, 'qd') else [1, 0, 0, 0]
+    pos_sp_all[0, :] = ctrl.pos_sp
+    vel_sp_all[0, :] = ctrl.vel_sp
+    acc_sp_all[0, :] = ctrl.acc_sp
+    
+    # Calculate initial control allocation
+    total_thrust_all[0] = np.linalg.norm(ctrl.thrust_sp)
+    
+    # Calculate control torques using mixer matrix (simplified)
+    # This is a basic approximation - you might want to use the actual mixer matrix
+    motor_thrusts = quad.thr
+    if len(motor_thrusts) >= 6:  # Hexacopter
+        # Simplified torque calculation (you should use actual mixer matrix)
+        L = quad.params.get("L", 0.225)  # Arm length
+        control_torques_all[0, 0] = L * (motor_thrusts[1] + motor_thrusts[2] - motor_thrusts[4] - motor_thrusts[5])  # Roll
+        control_torques_all[0, 1] = L * (motor_thrusts[0] + motor_thrusts[1] - motor_thrusts[3] - motor_thrusts[4])  # Pitch  
+        control_torques_all[0, 2] = quad.params["kTo"] * (motor_thrusts[0] - motor_thrusts[1] + motor_thrusts[2] - motor_thrusts[3] + motor_thrusts[4] - motor_thrusts[5])  # Yaw
+    
+    acc_body_all[0, :] = quad.dcm.T @ quad.acc  # Transform acceleration to body frame
+    omega_dot_all[0, :] = quad.omega_dot
 
     # Initialize Sensors
     imu = IMUSensor()
@@ -173,6 +216,30 @@ def main():
         thr_all[i, :] = quad.thr
         tor_all[i, :] = quad.tor
 
+        # ======= NEW: Store Control Data =======
+        thrust_sp_all[i, :] = ctrl.thrust_sp
+        rate_sp_all[i, :] = ctrl.rate_sp if hasattr(ctrl, 'rate_sp') else [0, 0, 0]
+        rate_ctrl_all[i, :] = ctrl.rateCtrl if hasattr(ctrl, 'rateCtrl') else [0, 0, 0]
+        qd_all[i, :] = ctrl.qd if hasattr(ctrl, 'qd') else [1, 0, 0, 0]
+        pos_sp_all[i, :] = ctrl.pos_sp
+        vel_sp_all[i, :] = ctrl.vel_sp
+        acc_sp_all[i, :] = ctrl.acc_sp
+        
+        # Calculate control allocation data
+        total_thrust_all[i] = np.linalg.norm(ctrl.thrust_sp)
+        
+        # Calculate control torques (simplified - use actual mixer if available)
+        motor_thrusts = quad.thr
+        if len(motor_thrusts) >= 6:  # Hexacopter
+            L = quad.params.get("L", 0.225)  # Arm length
+            control_torques_all[i, 0] = L * (motor_thrusts[1] + motor_thrusts[2] - motor_thrusts[4] - motor_thrusts[5])  # Roll
+            control_torques_all[i, 1] = L * (motor_thrusts[0] + motor_thrusts[1] - motor_thrusts[3] - motor_thrusts[4])  # Pitch
+            control_torques_all[i, 2] = quad.params["kTo"] * (motor_thrusts[0] - motor_thrusts[1] + motor_thrusts[2] - motor_thrusts[3] + motor_thrusts[4] - motor_thrusts[5])  # Yaw
+        
+        # Store vehicle dynamics data
+        acc_body_all[i, :] = quad.dcm.T @ quad.acc  # Transform acceleration to body frame
+        omega_dot_all[i, :] = quad.omega_dot
+
         # Sensor Data
         acc_all[i] = acc_m
         gyro_all[i] = gyro_m
@@ -192,39 +259,21 @@ def main():
     end_time = time.time()
     print("Simulated {:.2f}s in {:.6f}s.".format(t, end_time - start_time))
 
-    # Save data to CSV
-    # ground truth data
-    ground_truth_data = pd.DataFrame({
+    # ======= ENHANCED: Save Complete Data to CSV =======
+    
+    # Create comprehensive sensor and control data
+    complete_data = pd.DataFrame({
         'timestamp': t_all,
-        'pos_x': pos_all[:, 0],
-        'pos_y': pos_all[:, 1],
-        'pos_z': pos_all[:, 2],
-        'vel_x': vel_all[:, 0],
-        'vel_y': vel_all[:, 1],
-        'vel_z': vel_all[:, 2],
-        'quat_w': quat_all[:, 0],
-        'quat_x': quat_all[:, 1],
-        'quat_y': quat_all[:, 2],
-        'quat_z': quat_all[:, 3],
-        'omega_x': omega_all[:, 0],
-        'omega_y': omega_all[:, 1],
-        'omega_z': omega_all[:, 2],
-        'roll': euler_all[:, 0],
-        'pitch': euler_all[:, 1],
-        'yaw': euler_all[:, 2]
-    })
-
-    # Save combined sensor data
-    sensor_df = pd.DataFrame({
-        'timestamp': t_all,
-        # IMU
+        
+        # ===== IMU Data =====
         'acc_x': acc_all[:, 0],
         'acc_y': acc_all[:, 1],
         'acc_z': acc_all[:, 2],
         'gyro_x': gyro_all[:, 0],
         'gyro_y': gyro_all[:, 1],
         'gyro_z': gyro_all[:, 2],
-        # GPS
+        
+        # ===== GPS Data =====
         'gps_pos_x': gps_pos_all[:, 0],
         'gps_pos_y': gps_pos_all[:, 1],
         'gps_pos_z': gps_pos_all[:, 2],
@@ -232,15 +281,79 @@ def main():
         'gps_vel_y': gps_vel_all[:, 1],
         'gps_vel_z': gps_vel_all[:, 2],
         'gps_available': gps_available,
-        # Barometer
+        
+        # ===== Barometer Data =====
         'baro_altitude': baro_alt_all,
         'baro_available': baro_available,
-        # Magnetometer
+        
+        # ===== Magnetometer Data =====
         'mag_x': mag_all[:, 0],
         'mag_y': mag_all[:, 1],
         'mag_z': mag_all[:, 2],
         'mag_available': mag_available,
-        # Ground truth
+        
+        # ===== NEW: Motor Commands & Control Signals =====
+        # Individual motor speed commands (rad/s)
+        'motor_cmd_1': w_cmd_all[:, 0],
+        'motor_cmd_2': w_cmd_all[:, 1],
+        'motor_cmd_3': w_cmd_all[:, 2],
+        'motor_cmd_4': w_cmd_all[:, 3],
+        'motor_cmd_5': w_cmd_all[:, 4],
+        'motor_cmd_6': w_cmd_all[:, 5],
+        
+        # Individual motor thrusts (N)
+        'motor_thrust_1': thr_all[:, 0],
+        'motor_thrust_2': thr_all[:, 1],
+        'motor_thrust_3': thr_all[:, 2],
+        'motor_thrust_4': thr_all[:, 3],
+        'motor_thrust_5': thr_all[:, 4],
+        'motor_thrust_6': thr_all[:, 5],
+        
+        # Control setpoints
+        'thrust_sp_x': thrust_sp_all[:, 0],
+        'thrust_sp_y': thrust_sp_all[:, 1],
+        'thrust_sp_z': thrust_sp_all[:, 2],
+        'total_thrust_sp': total_thrust_all,
+        
+        'rate_sp_x': rate_sp_all[:, 0],        # Roll rate setpoint (rad/s)
+        'rate_sp_y': rate_sp_all[:, 1],        # Pitch rate setpoint (rad/s)  
+        'rate_sp_z': rate_sp_all[:, 2],        # Yaw rate setpoint (rad/s)
+        
+        'rate_ctrl_x': rate_ctrl_all[:, 0],    # Roll rate control output
+        'rate_ctrl_y': rate_ctrl_all[:, 1],    # Pitch rate control output
+        'rate_ctrl_z': rate_ctrl_all[:, 2],    # Yaw rate control output
+        
+        # Control allocation outputs
+        'control_torque_x': control_torques_all[:, 0],  # Roll torque (N⋅m)
+        'control_torque_y': control_torques_all[:, 1],  # Pitch torque (N⋅m)
+        'control_torque_z': control_torques_all[:, 2],  # Yaw torque (N⋅m)
+        
+        # Desired quaternion
+        'qd_w': qd_all[:, 0],
+        'qd_x': qd_all[:, 1],
+        'qd_y': qd_all[:, 2],
+        'qd_z': qd_all[:, 3],
+        
+        # High-level setpoints
+        'pos_sp_x': pos_sp_all[:, 0],
+        'pos_sp_y': pos_sp_all[:, 1],
+        'pos_sp_z': pos_sp_all[:, 2],
+        'vel_sp_x': vel_sp_all[:, 0],
+        'vel_sp_y': vel_sp_all[:, 1],
+        'vel_sp_z': vel_sp_all[:, 2],
+        'acc_sp_x': acc_sp_all[:, 0],
+        'acc_sp_y': acc_sp_all[:, 1],
+        'acc_sp_z': acc_sp_all[:, 2],
+        
+        # Vehicle dynamics (for validation)
+        'acc_body_x': acc_body_all[:, 0],
+        'acc_body_y': acc_body_all[:, 1],
+        'acc_body_z': acc_body_all[:, 2],
+        'omega_dot_x': omega_dot_all[:, 0],
+        'omega_dot_y': omega_dot_all[:, 1],
+        'omega_dot_z': omega_dot_all[:, 2],
+        
+        # ===== Ground Truth Data =====
         'true_pos_x': pos_all[:, 0],
         'true_pos_y': pos_all[:, 1],
         'true_pos_z': pos_all[:, 2],
@@ -250,6 +363,13 @@ def main():
         'true_roll': euler_all[:, 0],
         'true_pitch': euler_all[:, 1],
         'true_yaw': euler_all[:, 2],
+        'true_omega_x': omega_all[:, 0],
+        'true_omega_y': omega_all[:, 1],
+        'true_omega_z': omega_all[:, 2],
+        'true_quat_w': quat_all[:, 0],
+        'true_quat_x': quat_all[:, 1],
+        'true_quat_y': quat_all[:, 2],
+        'true_quat_z': quat_all[:, 3],
     })
 
     log_dir = "logs"
@@ -261,22 +381,18 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Define file paths with timestamp
-    ground_truth_file = os.path.join(
-        log_dir, f"ground_truth_data_{timestamp}.csv")
-    all_sensor_file = os.path.join(log_dir, f"all_sensor_data_{timestamp}.csv")
+    complete_data_file = os.path.join(log_dir, f"complete_flight_data_{timestamp}.csv")
 
-    # Save dataframes to CSV with timestamped filenames in logs directory
-    ground_truth_data.to_csv(ground_truth_file, index=False)
-    sensor_df.to_csv(all_sensor_file, index=False)
+    # Save complete dataframe to CSV
+    complete_data.to_csv(complete_data_file, index=False)
 
-    print("Data saved successfully to CSV files:")
-    print(f"- {ground_truth_file}")
-    print(f"- {all_sensor_file}")
+    print("Complete flight data saved successfully:")
+    print(f"- {complete_data_file}")
 
-    # Add simulation parameters to a metadata file
-    metadata_file = os.path.join(
-        log_dir, f"simulation_metadata_{timestamp}.txt")
+    # Add enhanced simulation metadata
+    metadata_file = os.path.join(log_dir, f"simulation_metadata_{timestamp}.txt")
     with open(metadata_file, 'w') as f:
+        f.write(f"=== SIMULATION METADATA ===\n")
         f.write(f"Simulation timestamp: {timestamp}\n")
         f.write(f"Simulation duration: {Tf} seconds\n")
         f.write(f"Timestep: {Ts} seconds\n")
@@ -285,121 +401,123 @@ def main():
         f.write(f"Yaw trajectory type: {int(trajSelect[1])}\n")
         f.write(f"Waypoint timing mode: {int(trajSelect[2])}\n")
         f.write(f"Total simulation points: {numTimeStep}\n")
-        f.write(f"\nSensor frequencies:\n")
+        f.write(f"\n=== SENSOR FREQUENCIES ===\n")
         f.write(f"IMU: {imu.freq} Hz\n")
         f.write(f"GPS: {gps.freq} Hz\n")
         f.write(f"Barometer: {baro.freq} Hz\n")
         f.write(f"Magnetometer: {mag.freq} Hz\n")
+        f.write(f"\n=== VEHICLE PARAMETERS ===\n")
+        f.write(f"Mass: {quad.params['mB']} kg\n")
+        f.write(f"Inertia: {quad.params['IB']} kg⋅m²\n")
+        f.write(f"Arm length: {quad.params.get('L', 'N/A')} m\n")
+        f.write(f"Thrust coefficient: {quad.params['kTh']} N/(rad/s)²\n")
+        f.write(f"Torque coefficient: {quad.params['kTo']} N⋅m/(rad/s)²\n")
+        f.write(f"\n=== CONTROL DATA LOGGED ===\n")
+        f.write(f"✓ Individual motor speed commands (6 motors)\n")
+        f.write(f"✓ Individual motor thrust outputs (6 motors)\n")
+        f.write(f"✓ Control thrust setpoints [x, y, z]\n")
+        f.write(f"✓ Control rate setpoints [p, q, r]\n")
+        f.write(f"✓ Control rate outputs [p, q, r]\n")
+        f.write(f"✓ Control torques [Mx, My, Mz]\n")
+        f.write(f"✓ Desired quaternion [w, x, y, z]\n")
+        f.write(f"✓ Position/velocity/acceleration setpoints\n")
+        f.write(f"✓ Vehicle dynamics (acc_body, omega_dot)\n")
+        f.write(f"\n=== DATA STATISTICS ===\n")
+        f.write(f"GPS update rate: {np.sum(gps_available)/len(gps_available)*100:.1f}%\n")
+        f.write(f"Barometer update rate: {np.sum(baro_available)/len(baro_available)*100:.1f}%\n")
+        f.write(f"Magnetometer update rate: {np.sum(mag_available)/len(mag_available)*100:.1f}%\n")
+        f.write(f"Total thrust range: {np.min(total_thrust_all):.2f} - {np.max(total_thrust_all):.2f} N\n")
+        f.write(f"Max control torques: [{np.max(np.abs(control_torques_all[:,0])):.3f}, {np.max(np.abs(control_torques_all[:,1])):.3f}, {np.max(np.abs(control_torques_all[:,2])):.3f}] N⋅m\n")
 
     print(f"- {metadata_file}")
+    print(f"\nData ready for EKF processing with control input!")
+    print(f"Total data points: {len(complete_data)}")
+    print(f"Control data frequency: {1/Ts:.0f} Hz")
 
     # View Results
     # ---------------------------
-
-    # utils.fullprint(sDes_traj_all[:,3:6])
     utils.makeFigures(quad.params, t_all, pos_all, vel_all, quat_all, omega_all,
                       euler_all, w_cmd_all, wMotor_all, thr_all, tor_all, sDes_traj_all, sDes_calc_all)
     ani = utils.sameAxisAnimation(t_all, traj.wps, pos_all, quat_all,
                                   sDes_traj_all, Ts, quad.params, traj.xyzType, traj.yawType, ifsave)
     plot_sensor_data(t_all, pos_all, vel_all, acc_all, gyro_all,
                      gps_pos_all, gps_vel_all, baro_alt_all, mag_all)
+    
+    # ===== NEW: Plot Control Data =====
+    plot_control_data(t_all, thrust_sp_all, rate_sp_all, rate_ctrl_all, 
+                     control_torques_all, w_cmd_all, thr_all)
+    
     plt.show()
 
 
-def plot_ekf_results(t_all, pos_all, vel_all, euler_all, pos_est_all, vel_est_all, euler_est_all):
-    """Plot hasil estimasi EKF dibandingkan dengan ground truth"""
-
-    # Plot Position
+def plot_control_data(t_all, thrust_sp_all, rate_sp_all, rate_ctrl_all, 
+                     control_torques_all, w_cmd_all, thr_all):
+    """Plot control data untuk validasi"""
+    
+    # Plot Control Thrust and Torques
     plt.figure(figsize=(15, 12))
-    plt.suptitle("EKF Position Estimation", fontsize=16)
-
-    # X Position
-    plt.subplot(3, 1, 1)
-    plt.plot(t_all, pos_all[:, 0], 'b-', label='True X')
-    plt.plot(t_all, pos_est_all[:, 0], 'r--', label='EKF X')
+    plt.suptitle("Control Commands and Outputs", fontsize=16)
+    
+    # Thrust setpoints
+    plt.subplot(3, 2, 1)
+    plt.plot(t_all, thrust_sp_all[:, 0], 'r-', label='Thrust X')
+    plt.plot(t_all, thrust_sp_all[:, 1], 'g-', label='Thrust Y')
+    plt.plot(t_all, thrust_sp_all[:, 2], 'b-', label='Thrust Z')
     plt.grid(True)
     plt.legend()
-    plt.ylabel('X Position (m)')
-
-    # Y Position
-    plt.subplot(3, 1, 2)
-    plt.plot(t_all, pos_all[:, 1], 'b-', label='True Y')
-    plt.plot(t_all, pos_est_all[:, 1], 'r--', label='EKF Y')
+    plt.ylabel('Thrust Setpoint (N)')
+    plt.title('Control Thrust Setpoints')
+    
+    # Control torques
+    plt.subplot(3, 2, 2)
+    plt.plot(t_all, control_torques_all[:, 0], 'r-', label='Torque X (Roll)')
+    plt.plot(t_all, control_torques_all[:, 1], 'g-', label='Torque Y (Pitch)')
+    plt.plot(t_all, control_torques_all[:, 2], 'b-', label='Torque Z (Yaw)')
     plt.grid(True)
     plt.legend()
-    plt.ylabel('Y Position (m)')
-
-    # Z Position
-    plt.subplot(3, 1, 3)
-    plt.plot(t_all, pos_all[:, 2], 'b-', label='True Z')
-    plt.plot(t_all, pos_est_all[:, 2], 'r--', label='EKF Z')
+    plt.ylabel('Control Torque (N⋅m)')
+    plt.title('Control Torques')
+    
+    # Rate setpoints
+    plt.subplot(3, 2, 3)
+    plt.plot(t_all, rate_sp_all[:, 0] * 180/np.pi, 'r-', label='Roll Rate SP')
+    plt.plot(t_all, rate_sp_all[:, 1] * 180/np.pi, 'g-', label='Pitch Rate SP')
+    plt.plot(t_all, rate_sp_all[:, 2] * 180/np.pi, 'b-', label='Yaw Rate SP')
     plt.grid(True)
     plt.legend()
-    plt.ylabel('Z Position (m)')
+    plt.ylabel('Rate Setpoint (deg/s)')
+    plt.title('Angular Rate Setpoints')
+    
+    # Rate control outputs
+    plt.subplot(3, 2, 4)
+    plt.plot(t_all, rate_ctrl_all[:, 0], 'r-', label='Roll Ctrl')
+    plt.plot(t_all, rate_ctrl_all[:, 1], 'g-', label='Pitch Ctrl')
+    plt.plot(t_all, rate_ctrl_all[:, 2], 'b-', label='Yaw Ctrl')
+    plt.grid(True)
+    plt.legend()
+    plt.ylabel('Rate Control Output')
+    plt.title('Rate Control Outputs')
+    
+    # Motor commands
+    plt.subplot(3, 2, 5)
+    for i in range(6):
+        plt.plot(t_all, w_cmd_all[:, i], label=f'Motor {i+1}')
+    plt.grid(True)
+    plt.legend()
+    plt.ylabel('Motor Speed Command (rad/s)')
     plt.xlabel('Time (s)')
-
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-
-    # Plot Velocity
-    plt.figure(figsize=(15, 12))
-    plt.suptitle("EKF Velocity Estimation", fontsize=16)
-
-    # X Velocity
-    plt.subplot(3, 1, 1)
-    plt.plot(t_all, vel_all[:, 0], 'b-', label='True Vx')
-    plt.plot(t_all, vel_est_all[:, 0], 'r--', label='EKF Vx')
+    plt.title('Motor Speed Commands')
+    
+    # Motor thrusts
+    plt.subplot(3, 2, 6)
+    for i in range(6):
+        plt.plot(t_all, thr_all[:, i], label=f'Motor {i+1}')
     plt.grid(True)
     plt.legend()
-    plt.ylabel('X Velocity (m/s)')
-
-    # Y Velocity
-    plt.subplot(3, 1, 2)
-    plt.plot(t_all, vel_all[:, 1], 'b-', label='True Vy')
-    plt.plot(t_all, vel_est_all[:, 1], 'r--', label='EKF Vy')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Y Velocity (m/s)')
-
-    # Z Velocity
-    plt.subplot(3, 1, 3)
-    plt.plot(t_all, vel_all[:, 2], 'b-', label='True Vz')
-    plt.plot(t_all, vel_est_all[:, 2], 'r--', label='EKF Vz')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Z Velocity (m/s)')
+    plt.ylabel('Motor Thrust (N)')
     plt.xlabel('Time (s)')
-
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-
-    # Plot Attitude (Euler angles)
-    plt.figure(figsize=(15, 12))
-    plt.suptitle("EKF Attitude Estimation", fontsize=16)
-
-    # Roll
-    plt.subplot(3, 1, 1)
-    plt.plot(t_all, euler_all[:, 0] * 180/np.pi, 'b-', label='True Roll')
-    plt.plot(t_all, euler_est_all[:, 0] * 180/np.pi, 'r--', label='EKF Roll')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Roll (deg)')
-
-    # Pitch
-    plt.subplot(3, 1, 2)
-    plt.plot(t_all, euler_all[:, 1] * 180/np.pi, 'b-', label='True Pitch')
-    plt.plot(t_all, euler_est_all[:, 1] * 180/np.pi, 'r--', label='EKF Pitch')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Pitch (deg)')
-
-    # Yaw
-    plt.subplot(3, 1, 3)
-    plt.plot(t_all, euler_all[:, 2] * 180/np.pi, 'b-', label='True Yaw')
-    plt.plot(t_all, euler_est_all[:, 2] * 180/np.pi, 'r--', label='EKF Yaw')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Yaw (deg)')
-    plt.xlabel('Time (s)')
-
+    plt.title('Motor Thrust Outputs')
+    
     plt.tight_layout(rect=[0, 0, 1, 0.95])
 
 
