@@ -1,6 +1,186 @@
-import numpy as np
-from numpy import sin, cos, pi
 import config
+import numpy as np
+from numpy import sin, cos, pi, sqrt, arctan2, arcsin
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+class GeodeticTransform:
+    """
+    FIXED: Transformasi antara koordinat geodetic (lat/lon/alt) dan NED frame
+    """
+
+    def __init__(self, ref_lat=0.0, ref_lon=0.0, ref_alt=0.0):
+        """
+        Initialize dengan reference point untuk NED frame origin
+
+        Args:
+            ref_lat: Reference latitude (degrees)
+            ref_lon: Reference longitude (degrees) 
+            ref_alt: Reference altitude (m)
+        """
+        self.ref_lat_deg = ref_lat
+        self.ref_lon_deg = ref_lon
+        self.ref_alt = ref_alt
+
+        # Convert to radians for calculations
+        self.ref_lat = np.deg2rad(ref_lat)
+        self.ref_lon = np.deg2rad(ref_lon)
+
+        # WGS84 Earth parameters
+        self.a = 6378137.0           # Semi-major axis (m)
+        self.f = 1.0 / 298.257223563  # Flattening
+        self.e2 = 2 * self.f - self.f**2  # First eccentricity squared
+
+        # Pre-compute reference point in ECEF
+        self.ref_ecef = self.geodetic_to_ecef(
+            self.ref_lat, self.ref_lon, self.ref_alt)
+
+        # Transformation matrix from ECEF to NED at reference point
+        self.T_ecef_to_ned = self._compute_ecef_to_ned_matrix(
+            self.ref_lat, self.ref_lon)
+
+    def geodetic_to_ecef(self, lat, lon, alt):
+        """
+        Convert geodetic coordinates to ECEF
+
+        Args:
+            lat: Latitude (radians)
+            lon: Longitude (radians)
+            alt: Altitude (m)
+
+        Returns:
+            ECEF coordinates [x, y, z] (m)
+        """
+        # Radius of curvature in prime vertical
+        N = self.a / sqrt(1 - self.e2 * sin(lat)**2)
+
+        # ECEF coordinates
+        x = (N + alt) * cos(lat) * cos(lon)
+        y = (N + alt) * cos(lat) * sin(lon)
+        z = (N * (1 - self.e2) + alt) * sin(lat)
+
+        return np.array([x, y, z])
+
+    def ecef_to_geodetic(self, ecef):
+        """
+        Convert ECEF coordinates to geodetic (iterative method)
+
+        Args:
+            ecef: ECEF coordinates [x, y, z] (m)
+
+        Returns:
+            [lat, lon, alt] in radians, radians, meters
+        """
+        x, y, z = ecef
+
+        # Longitude
+        lon = arctan2(y, x)
+
+        # Iterative solution for latitude and altitude
+        p = sqrt(x**2 + y**2)
+        lat = arctan2(z, p * (1 - self.e2))
+
+        for _ in range(5):  # Usually converges in 2-3 iterations
+            N = self.a / sqrt(1 - self.e2 * sin(lat)**2)
+            alt = p / cos(lat) - N
+            lat = arctan2(z, p * (1 - self.e2 * N / (N + alt)))
+
+        return np.array([lat, lon, alt])
+
+    def _compute_ecef_to_ned_matrix(self, lat, lon):
+        """
+        Compute transformation matrix from ECEF to NED
+        """
+        T = np.array([
+            [-sin(lat) * cos(lon), -sin(lat) * sin(lon),  cos(lat)],
+            [-sin(lon),             cos(lon),             0],
+            [-cos(lat) * cos(lon), -cos(lat) * sin(lon), -sin(lat)]
+        ])
+        return T
+
+    def geodetic_to_ned(self, lat, lon, alt):
+        """
+        Convert geodetic coordinates to NED frame
+
+        Args:
+            lat: Latitude (radians)
+            lon: Longitude (radians)
+            alt: Altitude (m)
+
+        Returns:
+            NED coordinates [north, east, down] (m)
+        """
+        # Convert to ECEF
+        ecef = self.geodetic_to_ecef(lat, lon, alt)
+
+        # Translate to reference point
+        ecef_rel = ecef - self.ref_ecef
+
+        # Transform to NED
+        ned = self.T_ecef_to_ned @ ecef_rel
+
+        return ned
+
+    def ned_to_geodetic(self, ned):
+        """
+        Convert NED coordinates to geodetic
+
+        Args:
+            ned: NED coordinates [north, east, down] (m)
+
+        Returns:
+            [lat, lon, alt] in radians, radians, meters
+        """
+        # Transform NED to ECEF relative
+        ecef_rel = self.T_ecef_to_ned.T @ ned
+
+        # Add reference ECEF
+        ecef = ecef_rel + self.ref_ecef
+
+        # Convert to geodetic
+        return self.ecef_to_geodetic(ecef)
+
+    def geodetic_to_ned_simple(self, lat, lon, alt):
+        """
+        FIXED: Simple flat-earth approximation (faster, good for short distances)
+
+        Args:
+            lat: Latitude (radians)
+            lon: Longitude (radians)
+            alt: Altitude (m)
+
+        Returns:
+            NED coordinates [north, east, down] (m)
+        """
+        # Earth radius approximation
+        R_earth = 6371000.0  # meters
+
+        # Convert to NED using flat-earth approximation
+        north = (lat - self.ref_lat) * R_earth
+        east = (lon - self.ref_lon) * R_earth * cos(self.ref_lat)
+        down = -(alt - self.ref_alt)  # NED down is negative altitude
+
+        return np.array([north, east, down])
+
+    def ned_to_geodetic_simple(self, ned):
+        """
+        FIXED: Simple flat-earth approximation (inverse)
+
+        Args:
+            ned: NED coordinates [north, east, down] (m)
+
+        Returns:
+            [lat, lon, alt] in radians, radians, meters
+        """
+        R_earth = 6371000.0
+
+        lat = self.ref_lat + ned[0] / R_earth
+        lon = self.ref_lon + ned[1] / (R_earth * cos(self.ref_lat))
+        alt = self.ref_alt - ned[2]  # Convert down to altitude
+
+        return np.array([lat, lon, alt])
 
 
 class IMUSensor:
@@ -57,36 +237,182 @@ class IMUSensor:
 
 
 class GPSSensor:
-    def __init__(self):
-        # Noise parameters
-        self.pos_noise_std = 1.5  # m
-        self.vel_noise_std = 0.1  # m/s
+    """
+    FIXED: Realistic GPS sensor using home position concept
+    """
 
-        # GPS update rate (typically slower than IMU)
-        self.freq = 5  # Hz
-        self.dt = 1.0/self.freq
-        self.last_update = 0
+    def __init__(self, home_lat=-7.250445, home_lon=112.768845, home_alt=10.0):
+        """
+        Initialize realistic GPS sensor with home position
+
+        Args:
+            home_lat: Home latitude in degrees (Surabaya)
+            home_lon: Home longitude in degrees (Surabaya)  
+            home_alt: Home altitude in meters MSL
+        """
+        # Home position (reference point)
+        self.home_lat = home_lat  # degrees
+        self.home_lon = home_lon  # degrees
+        self.home_alt = home_alt  # meters MSL
+
+        # Earth parameters for conversion
+        self.deg_to_m_lat = 111320.0  # meters per degree latitude
+        self.deg_to_m_lon = 111320.0 * \
+            cos(np.deg2rad(home_lat))  # adjusted for latitude
+
+        # Realistic GPS parameters
+        self.pos_noise_std = 1.5     # meters horizontal
+        # meters vertical (GPS altitude usually worse)
+        self.alt_noise_std = 2.0
+        self.vel_noise_std = 0.1     # m/s
+
+        # GPS noise in coordinate domain
+        self.lat_noise_std = self.pos_noise_std / self.deg_to_m_lat  # degrees
+        self.lon_noise_std = self.pos_noise_std / self.deg_to_m_lon  # degrees
+
+        # FIXED: GPS timing - more flexible
+        self.freq = 5  # Hz (typical GPS update rate)
+        self.dt = 1.0 / self.freq
+        self.last_update = -999  # Force first measurement
+
+        # Statistics tracking
+        self.measurement_count = 0
+
+        print(f"Realistic GPS Sensor initialized:")
+        print(
+            f"  Home position: {home_lat:.6f}°, {home_lon:.6f}°, {home_alt:.1f}m MSL")
+        print(
+            f"  Position noise: ±{self.pos_noise_std}m horizontal, ±{self.alt_noise_std}m vertical")
+        print(
+            f"  Coordinate noise: ±{self.lat_noise_std*1e6:.1f}µ°lat, ±{self.lon_noise_std*1e6:.1f}µ°lon")
+        print(f"  Update rate: {self.freq} Hz")
 
     def measure(self, quad, t):
-        # Only provide measurement at specific frequency
-        if t - self.last_update < self.dt:
-            return None, None
+        """
+        FIXED: Realistic GPS measurement with proper timing
+
+        Args:
+            quad: Quadcopter object with .pos and .vel in NED frame
+            t: Current time
+
+        Returns:
+            tuple: (pos_ned_measured, vel_ned_measured, geodetic_raw)
+        """
+        # FIXED: More flexible timing check
+        if t - self.last_update < self.dt - 0.01:  # Small tolerance
+            return None, None, None
 
         self.last_update = t
+        self.measurement_count += 1
 
-        # Get true position and velocity in NED frame
-        pos_true = quad.pos
-        vel_true = quad.vel
+        # Get true position and velocity from simulation (NED frame)
+        true_pos_ned = quad.pos.copy()
+        true_vel_ned = quad.vel.copy()
 
-        # Add noise
-        pos_noise = np.random.normal(0, self.pos_noise_std, 3)
-        vel_noise = np.random.normal(0, self.vel_noise_std, 3)
+        # STEP 1: Convert true NED to geodetic coordinates
+        true_lat = self.home_lat + true_pos_ned[0] / self.deg_to_m_lat
+        true_lon = self.home_lon + true_pos_ned[1] / self.deg_to_m_lon
+        # NED down is negative altitude
+        true_alt = self.home_alt - true_pos_ned[2]
 
-        # Final GPS readings
-        pos_measured = pos_true + pos_noise
-        vel_measured = vel_true + vel_noise
+        # STEP 2: Apply realistic GPS noise in geodetic domain
+        lat_noise = np.random.normal(0, self.lat_noise_std)
+        lon_noise = np.random.normal(0, self.lon_noise_std)
+        alt_noise = np.random.normal(0, self.alt_noise_std)
 
-        return pos_measured, vel_measured
+        # Noisy GPS coordinates (what GPS receiver outputs)
+        gps_lat_raw = true_lat + lat_noise
+        gps_lon_raw = true_lon + lon_noise
+        gps_alt_raw = true_alt + alt_noise
+
+        # STEP 3: Convert noisy GPS coordinates back to NED for EKF
+        gps_north = (gps_lat_raw - self.home_lat) * self.deg_to_m_lat
+        gps_east = (gps_lon_raw - self.home_lon) * self.deg_to_m_lon
+        gps_down = -(gps_alt_raw - self.home_alt)
+
+        gps_pos_ned = np.array([gps_north, gps_east, gps_down])
+
+        # STEP 4: Add velocity noise directly in NED frame
+        vel_noise_ned = np.random.normal(0, self.vel_noise_std, 3)
+        gps_vel_ned = true_vel_ned + vel_noise_ned
+
+        # STEP 5: Package raw geodetic data
+        geodetic_raw = {
+            'latitude': gps_lat_raw,
+            'longitude': gps_lon_raw,
+            'altitude': gps_alt_raw,
+            # Distance from home
+            'home_distance': np.linalg.norm(true_pos_ned[:2]),
+        }
+
+        # FIXED: Debug output (occasional)
+        if self.measurement_count <= 5 or self.measurement_count % 50 == 0:
+            print(
+                f"GPS #{self.measurement_count}: Lat={gps_lat_raw:.6f}°, Lon={gps_lon_raw:.6f}°, Alt={gps_alt_raw:.1f}m")
+            print(
+                f"  Distance from home: {geodetic_raw['home_distance']:.1f}m")
+            print(f"  NED: {gps_pos_ned}")
+
+        if self.measurement_count == 1:  # First measurement
+            print("\n=== GPS DEBUG ===")
+            print(
+                f"Home Position: {self.home_lat:.6f}°, {self.home_lon:.6f}°, {self.home_alt:.1f}m")
+            print(f"True NED from quad: {true_pos_ned}")
+            print(
+                f"True Geodetic calculated: {true_lat:.6f}°, {true_lon:.6f}°, {true_alt:.1f}m")
+            print(f"GPS NED output: {gps_pos_ned}")
+            print(f"Difference: {gps_pos_ned - true_pos_ned}")
+            print("================\n")
+
+        return gps_pos_ned, gps_vel_ned, geodetic_raw
+
+    def get_reference_position(self):
+        """Get home/reference position"""
+        return {
+            'latitude': self.home_lat,
+            'longitude': self.home_lon,
+            'altitude': self.home_alt
+        }
+
+    def convert_ned_to_geodetic(self, ned_pos):
+        """
+        Convert NED position to geodetic coordinates
+
+        Args:
+            ned_pos: [north, east, down] in meters from home position
+
+        Returns:
+            dict: {'latitude': deg, 'longitude': deg, 'altitude': m}
+        """
+        north, east, down = ned_pos
+
+        latitude = self.home_lat + north / self.deg_to_m_lat
+        longitude = self.home_lon + east / self.deg_to_m_lon
+        altitude = self.home_alt - down
+
+        return {
+            'latitude': latitude,
+            'longitude': longitude,
+            'altitude': altitude
+        }
+
+    def convert_geodetic_to_ned(self, lat_deg, lon_deg, alt_m):
+        """
+        Convert geodetic coordinates to NED position
+
+        Args:
+            latitude: degrees
+            longitude: degrees
+            altitude: meters MSL
+
+        Returns:
+            np.array: [north, east, down] in meters from home
+        """
+        north = (lat_deg - self.home_lat) * self.deg_to_m_lat
+        east = (lon_deg - self.home_lon) * self.deg_to_m_lon
+        down = -(alt_m - self.home_alt)
+
+        return np.array([north, east, down])
 
 
 class AltitudeSensor:
