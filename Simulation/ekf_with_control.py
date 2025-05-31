@@ -24,7 +24,7 @@ from ekf_common import BaseEKF
 class EKFWithControl(BaseEKF):
     """
     Extended Kalman Filter with Control Input Integration
-    
+
     This class enhances the base EKF by incorporating control input data
     from the simulation to improve prediction accuracy, especially for
     position and velocity estimation.
@@ -32,12 +32,13 @@ class EKFWithControl(BaseEKF):
 
     def __init__(self, dt=0.01):
         super().__init__(dt)
-        
+
         # Control input specific parameters
-        self.control_trust_factor = 0.7  # How much to trust control vs IMU (0-1)
+        # How much to trust control vs IMU (0-1)
+        self.control_trust_factor = 0.7
         self.min_thrust_threshold = 0.1  # Minimum thrust to consider valid (N)
         self.max_thrust_threshold = 100  # Maximum reasonable thrust (N)
-        
+
         # Control input availability tracking
         self.control_available = False
         self.control_quality = 0.0  # Quality metric (0-1)
@@ -45,14 +46,14 @@ class EKFWithControl(BaseEKF):
     def predict_with_control_input(self, accel_body, gyro_body, control_data=None):
         """
         Enhanced prediction step with control input data
-        
+
         Workflow:
         1. Validate IMU and control input data
         2. Apply IMU-based prediction (fallback method)
         3. Calculate physics-based prediction from control inputs
         4. Fuse IMU and control predictions based on quality
         5. Propagate state and covariance
-        
+
         Args:
             accel_body: IMU accelerometer reading [ax, ay, az] (m/s²)
             gyro_body: IMU gyroscope reading [gx, gy, gz] (rad/s)
@@ -88,16 +89,18 @@ class EKFWithControl(BaseEKF):
             if 'motor_thrusts' in control_data and control_data['motor_thrusts'] is not None:
                 motor_thrusts = control_data['motor_thrusts']
                 total_thrust = np.sum(motor_thrusts)
-                
+
                 if len(motor_thrusts) == 6 and self.min_thrust_threshold < total_thrust < self.max_thrust_threshold:
                     # Check thrust distribution quality
                     thrust_variance = np.var(motor_thrusts)
                     thrust_mean = np.mean(motor_thrusts)
-                    thrust_cv = thrust_variance / (thrust_mean + 1e-6)  # Coefficient of variation
-                    
+                    thrust_cv = thrust_variance / \
+                        (thrust_mean + 1e-6)  # Coefficient of variation
+
                     # Quality metric based on thrust consistency and magnitude
-                    control_quality = min(1.0, total_thrust / 20.0) * max(0.1, 1.0 - thrust_cv)
-                    
+                    control_quality = min(
+                        1.0, total_thrust / 20.0) * max(0.1, 1.0 - thrust_cv)
+
                     accel_physics = self.dynamics.predict_acceleration_from_motor_thrusts(
                         motor_thrusts, R_bn)
                     self.prediction_mode = "MOTOR_THRUSTS"
@@ -106,10 +109,11 @@ class EKFWithControl(BaseEKF):
             elif 'thrust_sp' in control_data and control_data['thrust_sp'] is not None:
                 thrust_sp = control_data['thrust_sp']
                 thrust_magnitude = np.linalg.norm(thrust_sp)
-                
+
                 if thrust_magnitude > self.min_thrust_threshold:
-                    control_quality = min(1.0, thrust_magnitude / 20.0) * 0.8  # Slightly lower quality
-                    
+                    # Slightly lower quality
+                    control_quality = min(1.0, thrust_magnitude / 20.0) * 0.8
+
                     accel_physics = self.dynamics.predict_acceleration_from_thrust_vector(
                         thrust_sp, R_bn)
                     self.prediction_mode = "THRUST_VECTOR"
@@ -117,11 +121,13 @@ class EKFWithControl(BaseEKF):
             # Priority 3: Total thrust (assume vertical)
             elif 'total_thrust' in control_data and control_data['total_thrust'] is not None:
                 total_thrust = control_data['total_thrust']
-                
+
                 if self.min_thrust_threshold < total_thrust < self.max_thrust_threshold:
-                    control_quality = min(1.0, total_thrust / 20.0) * 0.6  # Lower quality
-                    
-                    thrust_body = np.array([0, 0, -total_thrust])  # Vertical thrust assumption
+                    control_quality = min(
+                        1.0, total_thrust / 20.0) * 0.6  # Lower quality
+
+                    # Vertical thrust assumption
+                    thrust_body = np.array([0, 0, -total_thrust])
                     accel_physics = self.dynamics.predict_acceleration_from_thrust_vector(
                         thrust_body, R_bn)
                     self.prediction_mode = "TOTAL_THRUST"
@@ -204,41 +210,41 @@ class EKFWithControl(BaseEKF):
     def get_state(self):
         """Enhanced state getter with control input information"""
         base_state = super().get_state()
-        
+
         # Add control-specific information
         base_state.update({
             'control_available': self.control_available,
             'control_quality': self.control_quality,
             'control_trust_factor': self.control_trust_factor
         })
-        
+
         return base_state
 
 
 def run_ekf_with_control_data(csv_file_path, use_magnetometer=True, magnetic_declination=0.0):
     """
     Main function to run EKF with control input data
-    
+
     Workflow:
     1. Load and validate simulation data
     2. Initialize EKF with first valid sensor measurements
     3. Process all timesteps with prediction and measurement updates
     4. Calculate error statistics vs ground truth
     5. Return results for analysis
-    
+
     Args:
         csv_file_path: Path to simulation data CSV
         use_magnetometer: Enable magnetometer updates for yaw
         magnetic_declination: Local magnetic declination in degrees
-        
+
     Returns:
         tuple: (ekf_instance, results_dict, raw_data)
     """
-    
+
     print("\n" + "="*80)
     print("EKF WITH CONTROL INPUT - ENHANCED PREDICTION")
     print("="*80)
-    
+
     # === STEP 1: LOAD AND VALIDATE DATA ===
     try:
         data = pd.read_csv(csv_file_path)
@@ -250,15 +256,15 @@ def run_ekf_with_control_data(csv_file_path, use_magnetometer=True, magnetic_dec
     # Check control data availability
     control_columns = {
         'motor_thrusts': ['motor_thrust_1', 'motor_thrust_2', 'motor_thrust_3',
-                         'motor_thrust_4', 'motor_thrust_5', 'motor_thrust_6'],
+                          'motor_thrust_4', 'motor_thrust_5', 'motor_thrust_6'],
         'thrust_sp': ['thrust_sp_x', 'thrust_sp_y', 'thrust_sp_z'],
         'control_torques': ['control_torque_x', 'control_torque_y', 'control_torque_z']
     }
-    
+
     data_availability = {}
     for key, columns in control_columns.items():
         data_availability[key] = all(col in data.columns for col in columns)
-    
+
     print(f"\n📊 Control Data Availability:")
     for key, available in data_availability.items():
         status = "✅" if available else "❌"
@@ -287,7 +293,7 @@ def run_ekf_with_control_data(csv_file_path, use_magnetometer=True, magnetic_dec
 
     # === STEP 3: PROCESS ALL DATA ===
     results = process_all_data(ekf, data, data_availability, use_magnetometer)
-    
+
     if len(results['timestamp']) < 100:
         print(f"❌ Insufficient valid results: {len(results['timestamp'])}")
         return None
@@ -303,42 +309,47 @@ def run_ekf_with_control_data(csv_file_path, use_magnetometer=True, magnetic_dec
 def find_initialization_point(data):
     """Find optimal initialization point with complete sensor data"""
     min_start_time = 0.1  # Skip startup period
-    
+
     for i in range(len(data)):
         row = data.iloc[i]
-        
+
         if row['timestamp'] < min_start_time:
             continue
-            
+
         # Check GPS availability
         if row['gps_available'] != 1:
             continue
-            
+
         # Validate GPS data
-        gps_pos = np.array([row['gps_pos_ned_x'], row['gps_pos_ned_y'], row['gps_pos_ned_z']])
-        gps_vel = np.array([row['gps_vel_ned_x'], row['gps_vel_ned_y'], row['gps_vel_ned_z']])
-        
+        gps_pos = np.array(
+            [row['gps_pos_ned_x'], row['gps_pos_ned_y'], row['gps_pos_ned_z']])
+        gps_vel = np.array(
+            [row['gps_vel_ned_x'], row['gps_vel_ned_y'], row['gps_vel_ned_z']])
+
         if np.any(np.isnan(gps_pos)) or np.any(np.isnan(gps_vel)):
             continue
-            
+
         # Validate IMU data
         acc = np.array([row['acc_x'], row['acc_y'], row['acc_z']])
         gyro = np.array([row['gyro_x'], row['gyro_y'], row['gyro_z']])
-        
+
         if np.any(np.isnan(acc)) or np.any(np.isnan(gyro)) or np.linalg.norm(acc) < 0.1:
             continue
-            
-        print(f"🎯 Initialization point found: index {i}, time {row['timestamp']:.3f}s")
+
+        print(
+            f"🎯 Initialization point found: index {i}, time {row['timestamp']:.3f}s")
         return i
-    
+
     return None
 
 
 def initialize_ekf_state(ekf, row, use_magnetometer):
     """Initialize EKF state with sensor data"""
     try:
-        gps_pos = np.array([row['gps_pos_ned_x'], row['gps_pos_ned_y'], row['gps_pos_ned_z']])
-        gps_vel = np.array([row['gps_vel_ned_x'], row['gps_vel_ned_y'], row['gps_vel_ned_z']])
+        gps_pos = np.array(
+            [row['gps_pos_ned_x'], row['gps_pos_ned_y'], row['gps_pos_ned_z']])
+        gps_vel = np.array(
+            [row['gps_vel_ned_x'], row['gps_vel_ned_y'], row['gps_vel_ned_z']])
         initial_acc = np.array([row['acc_x'], row['acc_y'], row['acc_z']])
         initial_gyro = np.array([row['gyro_x'], row['gyro_y'], row['gyro_z']])
 
@@ -350,9 +361,10 @@ def initialize_ekf_state(ekf, row, use_magnetometer):
         # Use ground truth yaw for testing purposes
         true_yaw = row['true_yaw'] if use_magnetometer else None
 
-        ekf.initialize_state(gps_pos, gps_vel, initial_acc, initial_gyro, initial_mag, true_yaw)
+        ekf.initialize_state(gps_pos, gps_vel, initial_acc,
+                             initial_gyro, initial_mag, true_yaw)
         return True
-        
+
     except Exception as e:
         print(f"❌ Initialization error: {str(e)}")
         return False
@@ -362,25 +374,25 @@ def process_all_data(ekf, data, data_availability, use_magnetometer):
     """Process all simulation data through EKF"""
     n_samples = len(data)
     min_processing_time = 0.05
-    
+
     # Initialize results storage
     results = {
         'timestamp': [], 'position': [], 'velocity': [], 'attitude': [],
         'acc_bias': [], 'gyro_bias': [], 'pos_std': [], 'vel_std': [], 'att_std': [],
         'prediction_modes': [], 'control_quality': []
     }
-    
+
     # Statistics counters
     stats = {
-        'prediction_count': 0, 'gps_updates': 0, 'baro_updates': 0, 
+        'prediction_count': 0, 'gps_updates': 0, 'baro_updates': 0,
         'mag_updates': 0, 'control_used': 0, 'skipped_samples': 0
     }
-    
+
     print(f"🔄 Processing {n_samples} samples...")
-    
+
     for i in range(n_samples):
         row = data.iloc[i]
-        
+
         # Skip early timestamps
         if row['timestamp'] < min_processing_time:
             stats['skipped_samples'] += 1
@@ -409,7 +421,7 @@ def process_all_data(ekf, data, data_availability, use_magnetometer):
         # === MEASUREMENT UPDATES ===
         stats['gps_updates'] += update_gps_measurements(ekf, row)
         stats['baro_updates'] += update_barometer_measurement(ekf, row)
-        
+
         if use_magnetometer:
             stats['mag_updates'] += update_magnetometer_measurement(ekf, row)
 
@@ -441,24 +453,24 @@ def prepare_imu_data(row):
     """Prepare and validate IMU data"""
     accel_body = np.array([row['acc_x'], row['acc_y'], row['acc_z']])
     gyro_body = np.array([row['gyro_x'], row['gyro_y'], row['gyro_z']])
-    
+
     # Validation
     acc_norm = np.linalg.norm(accel_body)
-    if (np.any(np.isnan(accel_body)) or np.any(np.isnan(gyro_body)) or 
-        acc_norm < 0.1 or acc_norm > 100):
+    if (np.any(np.isnan(accel_body)) or np.any(np.isnan(gyro_body)) or
+            acc_norm < 0.1 or acc_norm > 100):
         raise ValueError("Invalid IMU data")
-    
+
     # Safety clipping
     accel_body = np.clip(accel_body, -50, 50)
     gyro_body = np.clip(gyro_body, -20, 20)
-    
+
     return accel_body, gyro_body
 
 
 def prepare_control_data(row, data_availability):
     """Prepare control input data with validation"""
     control_data = {}
-    
+
     # Motor thrusts (highest priority)
     if data_availability['motor_thrusts']:
         motor_thrusts = np.array([
@@ -466,14 +478,15 @@ def prepare_control_data(row, data_availability):
             row['motor_thrust_4'], row['motor_thrust_5'], row['motor_thrust_6']
         ])
         if (np.sum(motor_thrusts) > 0.1 and not np.any(np.isnan(motor_thrusts)) and
-            not np.allclose(motor_thrusts, 0, atol=1e-6)):
+                not np.allclose(motor_thrusts, 0, atol=1e-6)):
             control_data['motor_thrusts'] = motor_thrusts
 
     # Thrust setpoint (second priority)
     if data_availability['thrust_sp'] and 'motor_thrusts' not in control_data:
-        thrust_sp = np.array([row['thrust_sp_x'], row['thrust_sp_y'], row['thrust_sp_z']])
+        thrust_sp = np.array(
+            [row['thrust_sp_x'], row['thrust_sp_y'], row['thrust_sp_z']])
         if (np.linalg.norm(thrust_sp) > 0.1 and not np.any(np.isnan(thrust_sp)) and
-            not np.allclose(thrust_sp, 0, atol=1e-6)):
+                not np.allclose(thrust_sp, 0, atol=1e-6)):
             control_data['thrust_sp'] = thrust_sp
 
     # Total thrust (fallback)
@@ -497,15 +510,17 @@ def update_gps_measurements(ekf, row):
     """Update GPS measurements if available"""
     if row['gps_available'] != 1:
         return 0
-        
-    gps_pos = np.array([row['gps_pos_ned_x'], row['gps_pos_ned_y'], row['gps_pos_ned_z']])
-    gps_vel = np.array([row['gps_vel_ned_x'], row['gps_vel_ned_y'], row['gps_vel_ned_z']])
-    
+
+    gps_pos = np.array(
+        [row['gps_pos_ned_x'], row['gps_pos_ned_y'], row['gps_pos_ned_z']])
+    gps_vel = np.array(
+        [row['gps_vel_ned_x'], row['gps_vel_ned_y'], row['gps_vel_ned_z']])
+
     # Validate GPS data
     if (np.any(np.isnan(gps_pos)) or np.any(np.isnan(gps_vel)) or
-        np.allclose(gps_pos, 0, atol=1e-6) or np.linalg.norm(gps_pos) > 10000):
+            np.allclose(gps_pos, 0, atol=1e-6) or np.linalg.norm(gps_pos) > 10000):
         return 0
-    
+
     ekf.update_gps_position(gps_pos)
     ekf.update_gps_velocity(gps_vel)
     return 1
@@ -515,11 +530,11 @@ def update_barometer_measurement(ekf, row):
     """Update barometer measurement if available"""
     if row['baro_available'] != 1:
         return 0
-        
+
     baro_alt = row['baro_altitude']
     if np.isnan(baro_alt) or not (-1000 < baro_alt < 10000) or abs(baro_alt) <= 1e-6:
         return 0
-    
+
     ekf.update_barometer(baro_alt)
     return 1
 
@@ -528,12 +543,12 @@ def update_magnetometer_measurement(ekf, row):
     """Update magnetometer measurement if available"""
     if 'mag_available' not in row or row['mag_available'] != 1:
         return 0
-        
+
     mag_body = np.array([row['mag_x'], row['mag_y'], row['mag_z']])
     if (np.any(np.isnan(mag_body)) or np.allclose(mag_body, 0, atol=1e-6) or
-        not (0.1 < np.linalg.norm(mag_body) < 5.0)):
+            not (0.1 < np.linalg.norm(mag_body) < 5.0)):
         return 0
-    
+
     ekf.update_magnetometer(mag_body)
     return 1
 
@@ -562,25 +577,28 @@ def calculate_error_statistics(results, data):
     # Find matching ground truth data
     valid_indices = []
     result_timestamps = np.array(results['timestamp'])
-    
+
     for i, t in enumerate(data['timestamp']):
         if t in result_timestamps:
             # Validate ground truth data
             row = data.iloc[i]
-            true_pos = np.array([row['true_pos_x'], row['true_pos_y'], row['true_pos_z']])
-            true_att = np.array([row['true_roll'], row['true_pitch'], row['true_yaw']])
-            
-            if (not np.allclose(true_pos, 0, atol=1e-6) and 
-                not np.allclose(true_att, 0, atol=1e-6)):
+            true_pos = np.array(
+                [row['true_pos_x'], row['true_pos_y'], row['true_pos_z']])
+            true_att = np.array(
+                [row['true_roll'], row['true_pitch'], row['true_yaw']])
+
+            if (not np.allclose(true_pos, 0, atol=1e-6) and
+                    not np.allclose(true_att, 0, atol=1e-6)):
                 valid_indices.append(i)
 
     if len(valid_indices) < 50:
-        print(f"⚠️  Warning: Only {len(valid_indices)} valid ground truth samples")
+        print(
+            f"⚠️  Warning: Only {len(valid_indices)} valid ground truth samples")
 
     # Extract ground truth
     true_pos = np.column_stack([
         data.iloc[valid_indices]['true_pos_x'],
-        data.iloc[valid_indices]['true_pos_y'], 
+        data.iloc[valid_indices]['true_pos_y'],
         data.iloc[valid_indices]['true_pos_z']
     ])
     true_vel = np.column_stack([
@@ -597,16 +615,19 @@ def calculate_error_statistics(results, data):
     # Align EKF results with ground truth
     gt_timestamps = data.iloc[valid_indices]['timestamp'].values
     matching_indices = []
-    
+
     for gt_time in gt_timestamps:
         result_idx = np.argmin(np.abs(result_timestamps - gt_time))
         if abs(result_timestamps[result_idx] - gt_time) < 1e-6:
             matching_indices.append(result_idx)
 
     # Calculate errors
-    pos_error = results['position'][matching_indices] - true_pos[:len(matching_indices)]
-    vel_error = results['velocity'][matching_indices] - true_vel[:len(matching_indices)]
-    att_error = results['attitude'][matching_indices] - true_att[:len(matching_indices)]
+    pos_error = results['position'][matching_indices] - \
+        true_pos[:len(matching_indices)]
+    vel_error = results['velocity'][matching_indices] - \
+        true_vel[:len(matching_indices)]
+    att_error = results['attitude'][matching_indices] - \
+        true_att[:len(matching_indices)]
 
     # Handle angle wrapping
     att_error = np.arctan2(np.sin(att_error), np.cos(att_error))
@@ -618,7 +639,7 @@ def calculate_error_statistics(results, data):
 
     return {
         'pos_rmse': pos_rmse,
-        'vel_rmse': vel_rmse, 
+        'vel_rmse': vel_rmse,
         'att_rmse': att_rmse,
         'valid_samples': len(matching_indices)
     }
@@ -627,61 +648,65 @@ def calculate_error_statistics(results, data):
 def print_performance_summary(error_stats, results):
     """Print comprehensive performance summary"""
     pos_rmse = error_stats['pos_rmse']
-    vel_rmse = error_stats['vel_rmse'] 
+    vel_rmse = error_stats['vel_rmse']
     att_rmse = error_stats['att_rmse']
-    
+
     print(f"\n🎯 PERFORMANCE SUMMARY (Control Input Enhanced)")
     print("="*60)
-    
-    print(f"📍 Position RMSE [X,Y,Z]: [{pos_rmse[0]:.4f}, {pos_rmse[1]:.4f}, {pos_rmse[2]:.4f}] m")
+
+    print(
+        f"📍 Position RMSE [X,Y,Z]: [{pos_rmse[0]:.4f}, {pos_rmse[1]:.4f}, {pos_rmse[2]:.4f}] m")
     print(f"   Total Position RMSE: {np.linalg.norm(pos_rmse):.4f} m")
-    
-    print(f"🏃 Velocity RMSE [X,Y,Z]: [{vel_rmse[0]:.4f}, {vel_rmse[1]:.4f}, {vel_rmse[2]:.4f}] m/s")
+
+    print(
+        f"🏃 Velocity RMSE [X,Y,Z]: [{vel_rmse[0]:.4f}, {vel_rmse[1]:.4f}, {vel_rmse[2]:.4f}] m/s")
     print(f"   Total Velocity RMSE: {np.linalg.norm(vel_rmse):.4f} m/s")
-    
-    print(f"🎯 Attitude RMSE [R,P,Y]: [{np.rad2deg(att_rmse[0]):.3f}, {np.rad2deg(att_rmse[1]):.3f}, {np.rad2deg(att_rmse[2]):.3f}] deg")
-    
+
+    print(
+        f"🎯 Attitude RMSE [R,P,Y]: [{np.rad2deg(att_rmse[0]):.3f}, {np.rad2deg(att_rmse[1]):.3f}, {np.rad2deg(att_rmse[2]):.3f}] deg")
+
     # Control input analysis
     if 'control_quality' in results:
         control_quality = np.array(results['control_quality'])
         avg_quality = np.mean(control_quality[control_quality > 0])
-        control_usage = np.sum(control_quality > 0.1) / len(control_quality) * 100
-        
+        control_usage = np.sum(control_quality > 0.1) / \
+            len(control_quality) * 100
+
         print(f"\n🎮 Control Input Analysis:")
         print(f"   Average control quality: {avg_quality:.3f}")
         print(f"   Control usage: {control_usage:.1f}% of samples")
-    
+
     # Prediction mode distribution
     modes = results['prediction_modes']
     mode_counts = {}
     for mode in modes:
         mode_counts[mode] = mode_counts.get(mode, 0) + 1
-    
+
     print(f"\n🔄 Prediction Mode Distribution:")
     for mode, count in mode_counts.items():
         percentage = 100 * count / len(modes)
         print(f"   {mode}: {count} samples ({percentage:.1f}%)")
-    
+
     print("="*60)
 
 
 if __name__ == "__main__":
     # Example usage
-    csv_file_path = "logs/complete_flight_data_with_geodetic_20250530_012243.csv"
-    
+    csv_file_path = "logs/complete_flight_data_with_geodetic_20250530_183803.csv"
+
     try:
         results = run_ekf_with_control_data(
-            csv_file_path, 
-            use_magnetometer=True, 
+            csv_file_path,
+            use_magnetometer=True,
             magnetic_declination=0.5  # Surabaya
         )
-        
+
         if results is not None:
             ekf, results_data, data = results
             print("✅ EKF with control input completed successfully!")
         else:
             print("❌ EKF processing failed!")
-            
+
     except Exception as e:
         print(f"❌ Error: {str(e)}")
         import traceback
