@@ -46,3 +46,4 @@ Thumbs.db
 /logs
 Simulation/logs/
 Simulation/ekf results/
+Simulation/ekf_comparison_results/

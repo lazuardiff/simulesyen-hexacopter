@@ -1093,7 +1093,7 @@ def plot_ekf_simulation_results(ekf_results, data):
 # Test the implementation
 if __name__ == "__main__":
     # Update with your simulation data file
-    csv_file_path = "logs/complete_flight_data_with_geodetic_20250530_111457.csv"
+    csv_file_path = "logs/complete_flight_data_with_geodetic_20250530_183803.csv"
 
     print("="*80)
     print("EKF WITH SIMULATION CONTROL DATA INTEGRATION")
