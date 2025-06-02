@@ -64,10 +64,10 @@ def get_default_config():
 
         # Plot and report settings
         'generate_plots': True,
-        'save_plots': True,
-        'show_plots': False,  # Set to True if you want to display plots on screen
-        'generate_report': True,
-        'save_results': True,
+        'save_plots': False,
+        'show_plots': True,
+        'generate_report': False,
+        'save_results': False,
 
         # Debug settings
         'verbose': False

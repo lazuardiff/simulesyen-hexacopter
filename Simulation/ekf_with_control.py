@@ -363,6 +363,21 @@ def initialize_ekf_state(ekf, row, use_magnetometer):
 
         ekf.initialize_state(gps_pos, gps_vel, initial_acc,
                              initial_gyro, initial_mag, true_yaw)
+
+        try:
+            q_gt = np.array([
+                row['true_quat_w'],
+                row['true_quat_x'],
+                row['true_quat_y'],
+                row['true_quat_z']
+            ])
+            ekf.x[6:10] = ekf.normalize_quaternion(q_gt)
+            # Sedikit turunkan kovarians attitude agar EKF “percaya”
+            ekf.P[6:9, 6:9] = np.diag([0.04, 0.04, 1.0])
+            print("✅  Ground-truth quaternion dipakai untuk inisialisasi")
+        except KeyError:
+            print("⚠️  Kolom quaternion ground-truth tidak ditemukan, lewati patch")
+
         return True
 
     except Exception as e:
