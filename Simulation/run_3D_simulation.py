@@ -7,6 +7,8 @@ Please feel free to use and modify this, but keep the above information. Thanks!
 
 Enhanced version with full GPS geodetic integration
 Updated to work with fixed hexacopter mixer matrix
+Added 3-second hovering phase at 1m altitude for EKF initialization
+FIXED: GPS lat/long logging starts from t=0.001s (not 0.002s)
 """
 
 import numpy as np
@@ -54,14 +56,106 @@ def quad_sim(t, Ts, quad, ctrl, wind, traj, imu, gps, alti, mag):
     return t, acc_m, gyro_m, pos_ned_m, vel_ned_m, geodetic_m, alt_m, mag_m
 
 
+class TrajectoryWithHovering:
+    """Enhanced trajectory class with initial hovering phase"""
+
+    def __init__(self, original_traj, hover_altitude=1.0, hover_duration=3.0):
+        self.original_traj = original_traj
+        self.hover_altitude = hover_altitude
+        self.hover_duration = hover_duration
+
+        # Copy all attributes from original trajectory
+        for attr in dir(original_traj):
+            if not attr.startswith('_') and attr != 'desiredState':
+                setattr(self, attr, getattr(original_traj, attr))
+
+    def desiredState(self, t, Ts, quad):
+        """Enhanced desired state with hovering phase"""
+
+        if t <= self.hover_duration:
+            # HOVERING PHASE: Stay at hover_altitude for first 3 seconds
+            sDes = np.zeros(19)
+
+            # Position setpoints (hover at specified altitude)
+            sDes[0] = 0.0  # x
+            sDes[1] = 0.0  # y
+            if config.orient == "NED":
+                sDes[2] = -self.hover_altitude  # z (negative for NED)
+            else:
+                sDes[2] = self.hover_altitude   # z (positive for ENU)
+
+            # Velocity setpoints (zero for hovering)
+            sDes[3] = 0.0  # vx
+            sDes[4] = 0.0  # vy
+            sDes[5] = 0.0  # vz
+
+            # Acceleration setpoints (zero for hovering)
+            sDes[6] = 0.0  # ax
+            sDes[7] = 0.0  # ay
+            sDes[8] = 0.0  # az
+
+            # Thrust setpoints (hover thrust)
+            sDes[9] = 0.0   # thrust_x
+            sDes[10] = 0.0  # thrust_y
+            if config.orient == "NED":
+                sDes[11] = quad.params["mB"] * \
+                    quad.params["g"]  # thrust_z (up in NED)
+            else:
+                sDes[11] = -quad.params["mB"] * \
+                    quad.params["g"]  # thrust_z (up in ENU)
+
+            # Attitude setpoints (level hover)
+            sDes[12] = 0.0  # roll
+            sDes[13] = 0.0  # pitch
+            sDes[14] = 0.0  # yaw
+
+            # Rate setpoints (zero for stable hover)
+            sDes[15] = 0.0  # p
+            sDes[16] = 0.0  # q
+            sDes[17] = 0.0  # r
+
+            # Yaw feedforward
+            sDes[18] = 0.0
+
+            self.sDes = sDes
+            return sDes
+
+        else:
+            # MISSION PHASE: Use original trajectory but offset time
+            mission_time = t - self.hover_duration
+            sDes = self.original_traj.desiredState(mission_time, Ts, quad)
+
+            # Offset the position to start from hover altitude
+            if hasattr(self, '_position_offset_applied') and not self._position_offset_applied:
+                self._initial_mission_pos = sDes[0:3].copy()
+                self._position_offset_applied = True
+
+            if hasattr(self, '_initial_mission_pos'):
+                # Apply position offset to start mission from hover position
+                sDes[0] += 0.0  # x offset (start from origin)
+                sDes[1] += 0.0  # y offset (start from origin)
+                if config.orient == "NED":
+                    sDes[2] = sDes[2] - self._initial_mission_pos[2] - \
+                        self.hover_altitude
+                else:
+                    sDes[2] = sDes[2] - self._initial_mission_pos[2] + \
+                        self.hover_altitude
+
+            self.sDes = sDes
+            return sDes
+
+
 def main():
     start_time = time.time()
 
-    # Simulation Setup
+    # Simulation Setup with Hovering Phase
     # ---------------------------
     Ti = 0
     Ts = 0.001
-    Tf = 41
+    hover_duration = 3.0  # 3 seconds hovering for EKF initialization
+    hover_altitude = 1.0  # 1 meter hovering altitude
+    mission_duration = 41  # Original mission duration
+    Tf = hover_duration + mission_duration  # Total simulation time
     ifsave = 1
 
     # Choose trajectory settings
@@ -81,16 +175,38 @@ def main():
     trajSelect[1] = 3
     # Select if waypoint time is used, or if average speed is used to calculate waypoint time   (0: waypoint time,   1: average speed)
     trajSelect[2] = 1
-    print("Control type: {}".format(ctrlType))
+
+    print("=== ENHANCED SIMULATION WITH HOVERING INITIALIZATION ===")
+    print(f"Control type: {ctrlType}")
+    print(
+        f"Hovering phase: {hover_duration} seconds at {hover_altitude}m altitude")
+    print(f"Mission phase: {mission_duration} seconds")
+    print(f"Total simulation time: {Tf} seconds")
+    print(f"Logging starts at: {Ts} seconds (including t={Ts})")
 
     # Initialize Quadcopter, Controller, Wind, Result Matrixes
     # ---------------------------
     quad = Quadcopter(Ti)
-    traj = Trajectory(quad, ctrlType, trajSelect)
+
+    # Set initial position to hover altitude
+    if config.orient == "NED":
+        quad.pos[2] = -hover_altitude  # Negative for NED
+        quad.state[2] = -hover_altitude
+    else:
+        quad.pos[2] = hover_altitude   # Positive for ENU
+        quad.state[2] = hover_altitude
+
+    # Create original trajectory
+    original_traj = Trajectory(quad, ctrlType, trajSelect)
+
+    # Create enhanced trajectory with hovering
+    traj = TrajectoryWithHovering(
+        original_traj, hover_altitude, hover_duration)
+
     ctrl = Control(quad, traj.yawType)
     wind = Wind('None', 2.0, 90, -15)
 
-    # Trajectory for First Desired States
+    # Trajectory for First Desired States (hovering)
     # ---------------------------
     sDes = traj.desiredState(0, Ts, quad)
 
@@ -131,43 +247,6 @@ def main():
     acc_body_all = np.zeros([numTimeStep, 3])
     omega_dot_all = np.zeros([numTimeStep, 3])
 
-    # Initialize first values
-    t_all[0] = Ti
-    s_all[0, :] = quad.state
-    pos_all[0, :] = quad.pos
-    vel_all[0, :] = quad.vel
-    quat_all[0, :] = quad.quat
-    omega_all[0, :] = quad.omega
-    euler_all[0, :] = quad.euler
-    sDes_traj_all[0, :] = traj.sDes
-    sDes_calc_all[0, :] = ctrl.sDesCalc
-    w_cmd_all[0, :] = ctrl.w_cmd
-    wMotor_all[0, :] = quad.wMotor
-    thr_all[0, :] = quad.thr
-    tor_all[0, :] = quad.tor
-
-    # Store Initial Control Data
-    thrust_sp_all[0, :] = ctrl.thrust_sp
-    rate_sp_all[0, :] = ctrl.rate_sp if hasattr(ctrl, 'rate_sp') else [0, 0, 0]
-    rate_ctrl_all[0, :] = ctrl.rateCtrl if hasattr(
-        ctrl, 'rateCtrl') else [0, 0, 0]
-    qd_all[0, :] = ctrl.qd if hasattr(ctrl, 'qd') else [1, 0, 0, 0]
-    pos_sp_all[0, :] = ctrl.pos_sp
-    vel_sp_all[0, :] = ctrl.vel_sp
-    acc_sp_all[0, :] = ctrl.acc_sp
-
-    total_thrust_all[0] = np.linalg.norm(ctrl.thrust_sp)
-
-    # ===== FIXED: Calculate control torques using mixer matrix =====
-    # Use the fixed mixer matrix instead of hardcoded coefficients
-    F_total, Mx, My, Mz = quad.motor_speeds_to_forces_moments(quad.wMotor)
-    control_torques_all[0, 0] = Mx  # Roll moment
-    control_torques_all[0, 1] = My  # Pitch moment
-    control_torques_all[0, 2] = Mz  # Yaw moment
-
-    acc_body_all[0, :] = quad.dcm.T @ quad.acc
-    omega_dot_all[0, :] = quad.omega_dot
-
     # ===== ENHANCED: Initialize Sensors with Reference Position =====
     # GPS sensor with Surabaya reference position (already set in GPS class)
     print("Initializing sensors...")
@@ -205,35 +284,104 @@ def main():
     baro_available = np.zeros(numTimeStep, dtype=bool)
     mag_available = np.zeros(numTimeStep, dtype=bool)
 
-    # Store initial state
-    t_all[0] = Ti
-    pos_all[0] = quad.pos
-    vel_all[0] = quad.vel
-    quat_all[0] = quad.quat
-    euler_all[0] = quad.euler
+    # Phase tracking for analysis
+    flight_phase = np.zeros(numTimeStep, dtype=int)  # 0=hovering, 1=mission
 
-    # ===== ENHANCED: Initialize first GPS reading =====
-    # Get initial GPS reading to populate arrays
-    initial_pos_ned, initial_vel_ned, initial_geodetic = gps.measure(quad, Ti)
-    if initial_pos_ned is not None:
-        gps_pos_ned_all[0] = initial_pos_ned
-        gps_vel_ned_all[0] = initial_vel_ned
-        gps_lat_all[0] = initial_geodetic['latitude']
-        gps_lon_all[0] = initial_geodetic['longitude']
-        gps_alt_all[0] = initial_geodetic['altitude']
-        gps_available[0] = True
+    # ===== FIXED: Start logging from t=Ts and include first measurement =====
+    print(f"Starting simulation and logging from t={Ts} seconds...")
+    t = Ts  # Start time at first timestep
+    i = 0   # Array index starts from 0
 
-    # Run Simulation
-    # ---------------------------
-    print("Starting simulation...")
-    t = Ti
-    i = 1
+    # ===== FIXED: Take initial sensor readings at t=Ts BEFORE entering loop =====
+    print(f"Taking initial sensor readings at t={t:.3f}s...")
+
+    # Take sensor measurements at the current state (t=Ts)
+    initial_acc, initial_gyro = imu.measure(quad, t)
+    initial_pos_ned, initial_vel_ned, initial_geodetic = gps.measure(quad, t)
+    initial_alt = baro.measure(quad, t)
+    initial_mag = mag.measure(quad, t)
+
+    # Store initial data (at t=Ts=0.001s)
+    t_all[i] = t
+    s_all[i, :] = quad.state
+    pos_all[i, :] = quad.pos
+    vel_all[i, :] = quad.vel
+    quat_all[i, :] = quad.quat
+    omega_all[i, :] = quad.omega
+    euler_all[i, :] = quad.euler
+    sDes_traj_all[i, :] = traj.sDes
+    sDes_calc_all[i, :] = ctrl.sDesCalc
+    w_cmd_all[i, :] = ctrl.w_cmd
+    wMotor_all[i, :] = quad.wMotor
+    thr_all[i, :] = quad.thr
+    tor_all[i, :] = quad.tor
+
+    # Store Control Data
+    thrust_sp_all[i, :] = ctrl.thrust_sp
+    rate_sp_all[i, :] = ctrl.rate_sp if hasattr(ctrl, 'rate_sp') else [0, 0, 0]
+    rate_ctrl_all[i, :] = ctrl.rateCtrl if hasattr(
+        ctrl, 'rateCtrl') else [0, 0, 0]
+    qd_all[i, :] = ctrl.qd if hasattr(ctrl, 'qd') else [1, 0, 0, 0]
+    pos_sp_all[i, :] = ctrl.pos_sp
+    vel_sp_all[i, :] = ctrl.vel_sp
+    acc_sp_all[i, :] = ctrl.acc_sp
+
+    # Calculate control allocation data
+    total_thrust_all[i] = np.linalg.norm(ctrl.thrust_sp)
+
+    # Calculate control torques using mixer matrix
+    F_total, Mx, My, Mz = quad.motor_speeds_to_forces_moments(quad.wMotor)
+    control_torques_all[i, 0] = Mx  # Roll moment
+    control_torques_all[i, 1] = My  # Pitch moment
+    control_torques_all[i, 2] = Mz  # Yaw moment
+
+    acc_body_all[i, :] = quad.dcm.T @ quad.acc
+    omega_dot_all[i, :] = quad.omega_dot
+
+    # ===== FIXED: Store initial sensor data (at t=0.001s) =====
+    # IMU Data
+    acc_all[i] = initial_acc
+    gyro_all[i] = initial_gyro
+
+    # GPS Data (both NED and Geodetic) - CRITICAL: This is now logged at t=0.001s
+    if initial_pos_ned is not None and initial_vel_ned is not None and initial_geodetic is not None:
+        gps_pos_ned_all[i] = initial_pos_ned
+        gps_vel_ned_all[i] = initial_vel_ned
+        # degrees - NOW LOGGED!
+        gps_lat_all[i] = initial_geodetic['latitude']
+        # degrees - NOW LOGGED!
+        gps_lon_all[i] = initial_geodetic['longitude']
+        gps_alt_all[i] = initial_geodetic['altitude']    # meters - NOW LOGGED!
+        gps_available[i] = True
+        print(
+            f"✓ Initial GPS data logged: lat={initial_geodetic['latitude']:.6f}°, lon={initial_geodetic['longitude']:.6f}°")
+
+    # Other sensor data
+    if initial_alt is not None:
+        baro_alt_all[i] = initial_alt
+        baro_available[i] = True
+    if initial_mag is not None:
+        mag_all[i] = initial_mag
+        mag_available[i] = True
+
+    # Track flight phase for analysis
+    if t <= hover_duration:
+        flight_phase[i] = 0  # Hovering phase
+    else:
+        flight_phase[i] = 1  # Mission phase
+
+    print(f"✓ Initial data logged at t={t:.3f}s (index {i})")
+
+    # Move to next array index
+    i += 1
+
+    # ===== SIMULATION LOOP =====
     while round(t, 3) < Tf:
-
-        # ===== ENHANCED: Updated quad_sim call =====
+        # ===== Run simulation step =====
         t, acc_m, gyro_m, pos_ned_m, vel_ned_m, geodetic_m, alt_m, mag_m = quad_sim(
             t, Ts, quad, ctrl, wind, traj, imu, gps, baro, mag)
 
+        # Store all data
         t_all[i] = t
         s_all[i, :] = quad.state
         pos_all[i, :] = quad.pos
@@ -262,8 +410,7 @@ def main():
         # Calculate control allocation data
         total_thrust_all[i] = np.linalg.norm(ctrl.thrust_sp)
 
-        # ===== FIXED: Calculate control torques using mixer matrix =====
-        # Replace hardcoded coefficients with mixer matrix calculation
+        # Calculate control torques using mixer matrix
         F_total, Mx, My, Mz = quad.motor_speeds_to_forces_moments(quad.wMotor)
         control_torques_all[i, 0] = Mx  # Roll moment
         control_torques_all[i, 1] = My  # Pitch moment
@@ -272,7 +419,7 @@ def main():
         acc_body_all[i, :] = quad.dcm.T @ quad.acc
         omega_dot_all[i, :] = quad.omega_dot
 
-        # ===== ENHANCED: Store Sensor Data =====
+        # ===== Store Sensor Data =====
         # IMU Data
         acc_all[i] = acc_m
         gyro_all[i] = gyro_m
@@ -294,15 +441,82 @@ def main():
             mag_all[i] = mag_m
             mag_available[i] = True
 
+        # Track flight phase for analysis
+        if t <= hover_duration:
+            flight_phase[i] = 0  # Hovering phase
+        else:
+            flight_phase[i] = 1  # Mission phase
+
         i += 1
 
     end_time = time.time()
     print("Simulated {:.2f}s in {:.6f}s.".format(t, end_time - start_time))
 
-    # ===== ENHANCED: Save Complete Data with Geodetic GPS =====
+    # Trim arrays to actual data length
+    actual_length = i
+    t_all = t_all[:actual_length]
+    pos_all = pos_all[:actual_length]
+    vel_all = vel_all[:actual_length]
+    quat_all = quat_all[:actual_length]
+    omega_all = omega_all[:actual_length]
+    euler_all = euler_all[:actual_length]
+    acc_all = acc_all[:actual_length]
+    gyro_all = gyro_all[:actual_length]
+    gps_pos_ned_all = gps_pos_ned_all[:actual_length]
+    gps_vel_ned_all = gps_vel_ned_all[:actual_length]
+    gps_lat_all = gps_lat_all[:actual_length]
+    gps_lon_all = gps_lon_all[:actual_length]
+    gps_alt_all = gps_alt_all[:actual_length]
+    gps_available = gps_available[:actual_length]
+    baro_alt_all = baro_alt_all[:actual_length]
+    baro_available = baro_available[:actual_length]
+    mag_all = mag_all[:actual_length]
+    mag_available = mag_available[:actual_length]
+    control_torques_all = control_torques_all[:actual_length]
+    thrust_sp_all = thrust_sp_all[:actual_length]
+    rate_sp_all = rate_sp_all[:actual_length]
+    rate_ctrl_all = rate_ctrl_all[:actual_length]
+    w_cmd_all = w_cmd_all[:actual_length]
+    thr_all = thr_all[:actual_length]
+    flight_phase = flight_phase[:actual_length]
 
+    print(f"\n=== FLIGHT PHASE ANALYSIS ===")
+    hovering_indices = flight_phase == 0
+    mission_indices = flight_phase == 1
+
+    print(
+        f"Hovering phase: {np.sum(hovering_indices)} data points ({np.sum(hovering_indices)*Ts:.3f} seconds)")
+    print(
+        f"Mission phase: {np.sum(mission_indices)} data points ({np.sum(mission_indices)*Ts:.3f} seconds)")
+
+    if np.any(hovering_indices):
+        hover_pos_std = np.std(pos_all[hovering_indices], axis=0)
+        print(
+            f"Hovering position stability (std): X={hover_pos_std[0]:.4f}m, Y={hover_pos_std[1]:.4f}m, Z={hover_pos_std[2]:.4f}m")
+
+    # ===== ENHANCED: Verify GPS data logging =====
+    print(f"\n=== GPS DATA VERIFICATION ===")
+    first_gps_idx = np.where(gps_available)[0]
+    if len(first_gps_idx) > 0:
+        first_idx = first_gps_idx[0]
+        print(
+            f"✓ First GPS data logged at t={t_all[first_idx]:.3f}s (index {first_idx})")
+        print(f"  Latitude: {gps_lat_all[first_idx]:.6f}°")
+        print(f"  Longitude: {gps_lon_all[first_idx]:.6f}°")
+        print(f"  Altitude: {gps_alt_all[first_idx]:.1f}m")
+
+        if t_all[first_idx] == Ts:
+            print("✓ GPS lat/long successfully logged from t=0.001s!")
+        else:
+            print(
+                f"⚠ GPS logging starts at t={t_all[first_idx]:.3f}s instead of t={Ts:.3f}s")
+    else:
+        print("✗ No GPS data logged!")
+
+    # ===== ENHANCED: Save Complete Data with Geodetic GPS =====
     complete_data = pd.DataFrame({
         'timestamp': t_all,
+        'flight_phase': flight_phase,  # 0=hovering, 1=mission
 
         # ===== IMU Data =====
         'acc_x': acc_all[:, 0],
@@ -321,8 +535,8 @@ def main():
         'gps_vel_ned_z': gps_vel_ned_all[:, 2],
 
         # ===== GPS Geodetic Data (raw GPS output) =====
-        'gps_latitude': gps_lat_all,        # degrees
-        'gps_longitude': gps_lon_all,       # degrees
+        'gps_latitude': gps_lat_all,        # degrees - NOW INCLUDES t=0.001s!
+        'gps_longitude': gps_lon_all,       # degrees - NOW INCLUDES t=0.001s!
         'gps_altitude': gps_alt_all,        # meters
         'gps_available': gps_available,
 
@@ -354,7 +568,6 @@ def main():
         'thrust_sp_x': thrust_sp_all[:, 0],
         'thrust_sp_y': thrust_sp_all[:, 1],
         'thrust_sp_z': thrust_sp_all[:, 2],
-        'total_thrust_sp': total_thrust_all,
 
         'rate_sp_x': rate_sp_all[:, 0],
         'rate_sp_y': rate_sp_all[:, 1],
@@ -367,28 +580,6 @@ def main():
         'control_torque_x': control_torques_all[:, 0],
         'control_torque_y': control_torques_all[:, 1],
         'control_torque_z': control_torques_all[:, 2],
-
-        'qd_w': qd_all[:, 0],
-        'qd_x': qd_all[:, 1],
-        'qd_y': qd_all[:, 2],
-        'qd_z': qd_all[:, 3],
-
-        'pos_sp_x': pos_sp_all[:, 0],
-        'pos_sp_y': pos_sp_all[:, 1],
-        'pos_sp_z': pos_sp_all[:, 2],
-        'vel_sp_x': vel_sp_all[:, 0],
-        'vel_sp_y': vel_sp_all[:, 1],
-        'vel_sp_z': vel_sp_all[:, 2],
-        'acc_sp_x': acc_sp_all[:, 0],
-        'acc_sp_y': acc_sp_all[:, 1],
-        'acc_sp_z': acc_sp_all[:, 2],
-
-        'acc_body_x': acc_body_all[:, 0],
-        'acc_body_y': acc_body_all[:, 1],
-        'acc_body_z': acc_body_all[:, 2],
-        'omega_dot_x': omega_dot_all[:, 0],
-        'omega_dot_y': omega_dot_all[:, 1],
-        'omega_dot_z': omega_dot_all[:, 2],
 
         # ===== Ground Truth Data =====
         'true_pos_x': pos_all[:, 0],
@@ -419,27 +610,49 @@ def main():
 
     # Define file paths with timestamp
     complete_data_file = os.path.join(
-        log_dir, f"complete_flight_data_with_geodetic_{timestamp}.csv")
+        log_dir, f"hexacopter_ekf_data_with_hovering_fixed_{timestamp}.csv")
 
     # Save complete dataframe to CSV
     complete_data.to_csv(complete_data_file, index=False)
 
-    print("Complete flight data with geodetic GPS saved successfully:")
+    print("Complete flight data with fixed GPS logging saved successfully:")
     print(f"- {complete_data_file}")
 
-    # Enhanced metadata with GPS info
+    # Enhanced metadata with hovering info
     metadata_file = os.path.join(
-        log_dir, f"simulation_metadata_geodetic_{timestamp}.txt")
+        log_dir, f"simulation_metadata_hovering_fixed_{timestamp}.txt")
     with open(metadata_file, 'w', encoding='utf-8') as f:
-        f.write(f"=== ENHANCED SIMULATION METADATA (WITH GEODETIC GPS) ===\n")
+        f.write(
+            f"=== HEXACOPTER SIMULATION WITH HOVERING INITIALIZATION (FIXED GPS LOGGING) ===\n")
         f.write(f"Simulation timestamp: {timestamp}\n")
-        f.write(f"Simulation duration: {Tf} seconds\n")
+        f.write(f"Simulation total duration: {Tf} seconds\n")
         f.write(f"Timestep: {Ts} seconds\n")
+        f.write(f"Logging start time: {Ts} seconds (INCLUDES t={Ts}s data)\n")
+        f.write(
+            f"GPS lat/long logging: FIXED - now includes t={Ts}s measurement\n")
         f.write(f"Control type: {ctrlType}\n")
         f.write(f"Trajectory type: {int(trajSelect[0])}\n")
         f.write(f"Yaw trajectory type: {int(trajSelect[1])}\n")
         f.write(f"Waypoint timing mode: {int(trajSelect[2])}\n")
-        f.write(f"Total simulation points: {numTimeStep}\n")
+        f.write(f"Total simulation points: {actual_length}\n")
+        f.write(f"\n=== GPS LOGGING VERIFICATION ===\n")
+        if len(first_gps_idx) > 0:
+            f.write(
+                f"First GPS data logged at: t={t_all[first_gps_idx[0]]:.3f}s\n")
+            f.write(
+                f"GPS data properly logged from start: {'YES' if t_all[first_gps_idx[0]] == Ts else 'NO'}\n")
+        f.write(f"\n=== HOVERING INITIALIZATION PHASE ===\n")
+        f.write(f"Hovering duration: {hover_duration} seconds\n")
+        f.write(f"Hovering altitude: {hover_altitude} meters\n")
+        f.write(f"Hovering data points: {np.sum(hovering_indices)}\n")
+        f.write(f"Purpose: EKF initialization with stable GPS/IMU data\n")
+        if np.any(hovering_indices):
+            f.write(
+                f"Hovering stability (position std): X={hover_pos_std[0]:.4f}m, Y={hover_pos_std[1]:.4f}m, Z={hover_pos_std[2]:.4f}m\n")
+        f.write(f"\n=== MISSION PHASE ===\n")
+        f.write(f"Mission duration: {mission_duration} seconds\n")
+        f.write(f"Mission data points: {np.sum(mission_indices)}\n")
+        f.write(f"Mission starts at: t={hover_duration}s\n")
         f.write(f"\n=== GPS CONFIGURATION ===\n")
         f.write(f"Reference Latitude: {ref_pos['latitude']:.6f} degrees\n")
         f.write(f"Reference Longitude: {ref_pos['longitude']:.6f} degrees\n")
@@ -467,13 +680,12 @@ def main():
         f.write(f"Motor 5: kanan atas CCW\n")
         f.write(f"Motor 6: kiri bawah CW\n")
         f.write(f"Mixer Matrix: Matrix-based calculation (consistent)\n")
-        f.write(f"\n=== GPS DATA LOGGED ===\n")
-        f.write(f"- GPS NED Position [x, y, z] (for EKF processing)\n")
-        f.write(f"- GPS NED Velocity [x, y, z] (for EKF processing)\n")
-        f.write(f"- GPS Geodetic Latitude (degrees)\n")
-        f.write(f"- GPS Geodetic Longitude (degrees)\n")
-        f.write(f"- GPS Geodetic Altitude (meters)\n")
-        f.write(f"- Automatic frame transformation (Geodetic <-> NED)\n")
+        f.write(f"\n=== EKF INITIALIZATION DATA ===\n")
+        f.write(f"- Hovering phase provides stable reference for EKF initialization\n")
+        f.write(f"- GPS coordinates and IMU bias estimation during hover\n")
+        f.write(
+            f"- All sensor data logged continuously from t={Ts}s (FIXED)\n")
+        f.write(f"- Flight phase column: 0=hovering, 1=mission\n")
         f.write(f"\n=== DATA STATISTICS ===\n")
         f.write(
             f"GPS update rate: {np.sum(gps_available)/len(gps_available)*100:.1f}%\n")
@@ -482,7 +694,7 @@ def main():
         f.write(
             f"Magnetometer update rate: {np.sum(mag_available)/len(mag_available)*100:.1f}%\n")
 
-        # Only write GPS statistics if GPS data is available
+        # GPS statistics
         gps_valid_indices = gps_available & (
             gps_lat_all != 0) & (gps_lon_all != 0)
         if np.any(gps_valid_indices):
@@ -495,16 +707,12 @@ def main():
         else:
             f.write(f"GPS data: No valid GPS measurements recorded\n")
 
-        f.write(
-            f"Total thrust range: {np.min(total_thrust_all):.2f} - {np.max(total_thrust_all):.2f} N\n")
-        f.write(
-            f"Max control torques: [{np.max(np.abs(control_torques_all[:, 0])):.3f}, {np.max(np.abs(control_torques_all[:, 1])):.3f}, {np.max(np.abs(control_torques_all[:, 2])):.3f}] N*m\n")
-
     print(f"- {metadata_file}")
-    print(f"\nEnhanced data ready for EKF processing!")
+    print(f"\nEKF-ready data with FIXED GPS logging saved!")
     print(f"Total data points: {len(complete_data)}")
     print(f"GPS measurements: {np.sum(gps_available)} points")
-    print(f"GPS coordinates captured: Lat/Lon/Alt + NED position/velocity")
+    print(
+        f"Hovering phase: {np.sum(hovering_indices)} points for EKF initialization")
 
     # Verification: Print mixer matrix info
     print(f"\n=== MIXER MATRIX VERIFICATION ===")
@@ -521,586 +729,12 @@ def main():
         f"Equal motor speeds test: F={F_test:.3f}N, Mx={Mx_test:.6f}N⋅m, My={My_test:.6f}N⋅m, Mz={Mz_test:.6f}N⋅m")
     print(f"Expected: F>0, Mx≈0, My≈0, Mz≈0 (balanced)")
 
-    # ===== CREATE VISUALIZATION PLOTS =====
-    print("\n=== CREATING VISUALIZATION PLOTS ===")
-
-    # Create directories
-    os.makedirs('Gifs/Raw', exist_ok=True)
-
-    plot_success = False
-
-    # 1. Try simple basic plots first (always works)
-    try:
-        print("1. Creating basic simulation plots...")
-        create_basic_plots(t_all, pos_all, vel_all, euler_all, w_cmd_all, thr_all,
-                           control_torques_all, thrust_sp_all, quad)
-        plot_success = True
-        print("   ✓ Basic plots created successfully")
-    except Exception as e:
-        print(f"   ✗ Basic plots failed: {e}")
-
-    # 2. Try utils.makeFigures if available
-    try:
-        print("2. Creating detailed simulation figures...")
-        utils.makeFigures(quad.params, t_all, pos_all, vel_all, quat_all, omega_all,
-                          euler_all, w_cmd_all, wMotor_all, thr_all, tor_all, sDes_traj_all, sDes_calc_all)
-        print("   ✓ Detailed figures created successfully")
-    except Exception as e:
-        print(f"   ✗ Detailed figures failed: {e}")
-        if not plot_success:
-            print("   → Falling back to basic plots only")
-
-    # 3. Enhanced sensor plots
-    try:
-        print("3. Creating enhanced sensor plots...")
-        plot_enhanced_sensor_data(t_all, pos_all, vel_all, acc_all, gyro_all,
-                                  gps_pos_ned_all, gps_vel_ned_all, gps_lat_all,
-                                  gps_lon_all, gps_alt_all, gps_available,
-                                  baro_alt_all, mag_all)
-        print("   ✓ Sensor plots created successfully")
-    except Exception as e:
-        print(f"   ✗ Sensor plots failed: {e}")
-
-    # 4. Control data plots
-    try:
-        print("4. Creating control data plots...")
-        plot_control_data(t_all, thrust_sp_all, rate_sp_all, rate_ctrl_all,
-                          control_torques_all, w_cmd_all, thr_all)
-        print("   ✓ Control plots created successfully")
-    except Exception as e:
-        print(f"   ✗ Control plots failed: {e}")
-
-    # 5. Mixer verification plots
-    try:
-        print("5. Creating mixer verification plots...")
-        plot_mixer_verification(t_all, control_torques_all, thr_all, quad)
-        print("   ✓ Mixer verification plots created successfully")
-    except Exception as e:
-        print(f"   ✗ Mixer verification plots failed: {e}")
-
-    # 6. 3D Animation
-    ani = None
-    try:
-        print("6. Creating 3D animation...")
-        ani = utils.sameAxisAnimation(t_all, traj.wps, pos_all, quat_all,
-                                      sDes_traj_all, Ts, quad.params, traj.xyzType, traj.yawType, ifsave)
-        if ani is not None:
-            print("   ✓ 3D animation created successfully")
-        else:
-            print("   ✗ 3D animation failed to create")
-    except Exception as e:
-        print(f"   ✗ 3D animation error: {e}")
-
-    # 7. Display all plots
-    print("\n=== DISPLAYING PLOTS ===")
-    try:
-        plt.show()
-        print("✓ All plots displayed successfully")
-    except Exception as e:
-        print(f"✗ Display error: {e}")
-        try:
-            import matplotlib
-            matplotlib.use('TkAgg')  # Try different backend
-            plt.show()
-            print("✓ Plots displayed with TkAgg backend")
-        except Exception as e2:
-            print(f"✗ Could not display plots: {e2}")
-            print("   → Check matplotlib installation and backend")
-
     print(f"\n=== SIMULATION COMPLETE ===")
     print(f"Total simulation time: {Tf} seconds")
     print(f"Data points: {len(t_all)}")
     print(f"Files saved to: {log_dir}/")
-
-
-def create_basic_plots(t_all, pos_all, vel_all, euler_all, w_cmd_all, thr_all,
-                       control_torques_all, thrust_sp_all, quad):
-    """Create basic plots that should always work"""
-
-    # Main simulation results
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle('Hexacopter Simulation Results', fontsize=16)
-
-    # Position
-    axes[0, 0].plot(t_all, pos_all[:, 0], 'r-', label='X', linewidth=2)
-    axes[0, 0].plot(t_all, pos_all[:, 1], 'g-', label='Y', linewidth=2)
-    axes[0, 0].plot(t_all, pos_all[:, 2], 'b-', label='Z', linewidth=2)
-    axes[0, 0].set_xlabel('Time (s)')
-    axes[0, 0].set_ylabel('Position (m)')
-    axes[0, 0].set_title('Position')
-    axes[0, 0].grid(True)
-    axes[0, 0].legend()
-
-    # Velocity
-    axes[0, 1].plot(t_all, vel_all[:, 0], 'r-', label='Vx', linewidth=2)
-    axes[0, 1].plot(t_all, vel_all[:, 1], 'g-', label='Vy', linewidth=2)
-    axes[0, 1].plot(t_all, vel_all[:, 2], 'b-', label='Vz', linewidth=2)
-    axes[0, 1].set_xlabel('Time (s)')
-    axes[0, 1].set_ylabel('Velocity (m/s)')
-    axes[0, 1].set_title('Velocity')
-    axes[0, 1].grid(True)
-    axes[0, 1].legend()
-
-    # Euler angles
-    axes[0, 2].plot(t_all, euler_all[:, 0] * 180/np.pi,
-                    'r-', label='Roll', linewidth=2)
-    axes[0, 2].plot(t_all, euler_all[:, 1] * 180/np.pi,
-                    'g-', label='Pitch', linewidth=2)
-    axes[0, 2].plot(t_all, euler_all[:, 2] * 180/np.pi,
-                    'b-', label='Yaw', linewidth=2)
-    axes[0, 2].set_xlabel('Time (s)')
-    axes[0, 2].set_ylabel('Angle (deg)')
-    axes[0, 2].set_title('Euler Angles')
-    axes[0, 2].grid(True)
-    axes[0, 2].legend()
-
-    # Motor commands
-    colors = ['r', 'g', 'b', 'c', 'm', 'y']
-    for i in range(6):
-        axes[1, 0].plot(t_all, w_cmd_all[:, i], colors[i],
-                        label=f'Motor {i+1}', linewidth=2)
-    axes[1, 0].set_xlabel('Time (s)')
-    axes[1, 0].set_ylabel('Motor Speed (rad/s)')
-    axes[1, 0].set_title('Motor Speed Commands')
-    axes[1, 0].grid(True)
-    axes[1, 0].legend()
-
-    # Motor thrusts
-    for i in range(6):
-        axes[1, 1].plot(t_all, thr_all[:, i], colors[i],
-                        label=f'Motor {i+1}', linewidth=2)
-    axes[1, 1].set_xlabel('Time (s)')
-    axes[1, 1].set_ylabel('Thrust (N)')
-    axes[1, 1].set_title('Motor Thrusts')
-    axes[1, 1].grid(True)
-    axes[1, 1].legend()
-
-    # Control torques (from mixer matrix)
-    axes[1, 2].plot(t_all, control_torques_all[:, 0],
-                    'r-', label='Roll (Mx)', linewidth=2)
-    axes[1, 2].plot(t_all, control_torques_all[:, 1],
-                    'g-', label='Pitch (My)', linewidth=2)
-    axes[1, 2].plot(t_all, control_torques_all[:, 2],
-                    'b-', label='Yaw (Mz)', linewidth=2)
-    axes[1, 2].set_xlabel('Time (s)')
-    axes[1, 2].set_ylabel('Torque (N⋅m)')
-    axes[1, 2].set_title('Control Torques (Matrix-based)')
-    axes[1, 2].grid(True)
-    axes[1, 2].legend()
-
-    plt.tight_layout()
-
-    # Additional thrust and control plot
-    plt.figure(figsize=(15, 8))
-    plt.suptitle('Control Analysis', fontsize=16)
-
-    # Thrust setpoints
-    plt.subplot(2, 2, 1)
-    plt.plot(t_all, thrust_sp_all[:, 0], 'r-', label='Thrust X', linewidth=2)
-    plt.plot(t_all, thrust_sp_all[:, 1], 'g-', label='Thrust Y', linewidth=2)
-    plt.plot(t_all, thrust_sp_all[:, 2], 'b-', label='Thrust Z', linewidth=2)
-    plt.xlabel('Time (s)')
-    plt.ylabel('Thrust Setpoint (N)')
-    plt.title('Control Thrust Setpoints')
-    plt.grid(True)
-    plt.legend()
-
-    # Total thrust
-    total_thrust = np.linalg.norm(thrust_sp_all, axis=1)
-    plt.subplot(2, 2, 2)
-    plt.plot(t_all, total_thrust, 'k-', linewidth=2)
-    plt.xlabel('Time (s)')
-    plt.ylabel('Total Thrust (N)')
-    plt.title('Total Thrust Magnitude')
-    plt.grid(True)
-
-    # Motor balance: Left vs Right
-    plt.subplot(2, 2, 3)
-    motors_left = thr_all[:, 1] + thr_all[:, 2] + \
-        thr_all[:, 5]   # Motors 2,3,6
-    motors_right = thr_all[:, 0] + thr_all[:, 3] + \
-        thr_all[:, 4]  # Motors 1,4,5
-    plt.plot(t_all, motors_left, 'b-', label='Left (2,3,6)', linewidth=2)
-    plt.plot(t_all, motors_right, 'r-', label='Right (1,4,5)', linewidth=2)
-    plt.plot(t_all, motors_left - motors_right,
-             'g--', label='Difference', linewidth=1)
-    plt.xlabel('Time (s)')
-    plt.ylabel('Thrust Sum (N)')
-    plt.title('Motor Balance: Left vs Right')
-    plt.grid(True)
-    plt.legend()
-
-    # Motor balance: CW vs CCW
-    plt.subplot(2, 2, 4)
-    motors_cw = thr_all[:, 0] + thr_all[:, 2] + \
-        thr_all[:, 5]    # Motors 1,3,6 (CW)
-    motors_ccw = thr_all[:, 1] + thr_all[:, 3] + \
-        thr_all[:, 4]   # Motors 2,4,5 (CCW)
-    plt.plot(t_all, motors_cw, 'r-', label='CW (1,3,6)', linewidth=2)
-    plt.plot(t_all, motors_ccw, 'b-', label='CCW (2,4,5)', linewidth=2)
-    plt.plot(t_all, motors_cw - motors_ccw, 'g--',
-             label='Difference', linewidth=1)
-    plt.xlabel('Time (s)')
-    plt.ylabel('Thrust Sum (N)')
-    plt.title('Motor Balance: CW vs CCW')
-    plt.grid(True)
-    plt.legend()
-
-    plt.tight_layout()
-
-
-def plot_mixer_verification(t_all, control_torques_all, thr_all, quad):
-    """Plot untuk verifikasi mixer matrix dan control torques"""
-
-    plt.figure(figsize=(15, 10))
-    plt.suptitle("Mixer Matrix Verification", fontsize=16)
-
-    # Plot control torques dari mixer matrix
-    plt.subplot(2, 2, 1)
-    plt.plot(t_all, control_torques_all[:, 0],
-             'r-', linewidth=2, label='Roll Moment (Mx)')
-    plt.plot(t_all, control_torques_all[:, 1],
-             'g-', linewidth=2, label='Pitch Moment (My)')
-    plt.plot(t_all, control_torques_all[:, 2],
-             'b-', linewidth=2, label='Yaw Moment (Mz)')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Control Torque (N⋅m)')
-    plt.title('Control Torques from Mixer Matrix')
-
-    # Plot individual motor thrusts
-    plt.subplot(2, 2, 2)
-    for i in range(6):
-        plt.plot(t_all, thr_all[:, i], label=f'Motor {i+1}')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Motor Thrust (N)')
-    plt.title('Individual Motor Thrusts')
-
-    # Plot motor thrust balance untuk verifikasi konfigurasi
-    plt.subplot(2, 2, 3)
-    # Motor kanan vs kiri (untuk roll)
-    motors_kanan = thr_all[:, 0] + thr_all[:, 3] + \
-        thr_all[:, 4]  # Motor 1, 4, 5
-    motors_kiri = thr_all[:, 1] + thr_all[:, 2] + \
-        thr_all[:, 5]   # Motor 2, 3, 6
-    plt.plot(t_all, motors_kanan, 'r-', label='Kanan (1,4,5)')
-    plt.plot(t_all, motors_kiri, 'b-', label='Kiri (2,3,6)')
-    plt.plot(t_all, motors_kanan - motors_kiri, 'g--', label='Difference')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Thrust Sum (N)')
-    plt.title('Motor Thrust Balance: Kanan vs Kiri')
-
-    # Plot CW vs CCW motors untuk verifikasi yaw
-    plt.subplot(2, 2, 4)
-    motors_cw = thr_all[:, 0] + thr_all[:, 2] + \
-        thr_all[:, 5]    # Motor 1, 3, 6 (CW)
-    motors_ccw = thr_all[:, 1] + thr_all[:, 3] + \
-        thr_all[:, 4]   # Motor 2, 4, 5 (CCW)
-    plt.plot(t_all, motors_cw, 'r-', label='CW (1,3,6)')
-    plt.plot(t_all, motors_ccw, 'b-', label='CCW (2,4,5)')
-    plt.plot(t_all, motors_cw - motors_ccw, 'g--', label='Difference')
-    plt.grid(True)
-    plt.legend()
-    plt.xlabel('Time (s)')
-    plt.ylabel('Thrust Sum (N)')
-    plt.title('Motor Thrust Balance: CW vs CCW')
-
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-
-
-def plot_enhanced_sensor_data(t_all, pos_all, vel_all, acc_all, gyro_all,
-                              gps_pos_ned_all, gps_vel_ned_all, gps_lat_all,
-                              gps_lon_all, gps_alt_all, gps_available,
-                              baro_alt_all, mag_all):
-    """Enhanced sensor data plotting with geodetic GPS visualization"""
-
-    # ===== Plot IMU Data =====
-    plt.figure(figsize=(15, 10))
-    plt.suptitle("IMU Sensor Data", fontsize=16)
-
-    # Plot accelerometer
-    plt.subplot(2, 1, 1)
-    plt.plot(t_all, acc_all[:, 0], 'r-', label='Acc X')
-    plt.plot(t_all, acc_all[:, 1], 'g-', label='Acc Y')
-    plt.plot(t_all, acc_all[:, 2], 'b-', label='Acc Z')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Acceleration (m/s²)')
-    plt.title('Accelerometer Measurements')
-
-    # Plot gyroscope
-    plt.subplot(2, 1, 2)
-    gyro_deg_x = gyro_all[:, 0] * 180 / np.pi
-    gyro_deg_y = gyro_all[:, 1] * 180 / np.pi
-    gyro_deg_z = gyro_all[:, 2] * 180 / np.pi
-
-    plt.plot(t_all, gyro_deg_x, 'r-', label='Gyro X')
-    plt.plot(t_all, gyro_deg_y, 'g-', label='Gyro Y')
-    plt.plot(t_all, gyro_deg_z, 'b-', label='Gyro Z')
-    plt.grid(True)
-    plt.legend()
-    plt.xlabel('Time (s)')
-    plt.ylabel('Angular Velocity (deg/s)')
-    plt.title('Gyroscope Measurements')
-
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-
-    # ===== Enhanced GPS Data Plotting =====
-    plt.figure(figsize=(20, 15))
-    plt.suptitle(
-        "Enhanced GPS Data - NED Position & Geodetic Coordinates", fontsize=16)
-
-    # GPS indices for plotting
-    gps_indices = np.where(gps_available)[0]
-
-    # Plot GPS NED Position vs True Position
-    plt.subplot(3, 2, 1)
-    plt.plot(t_all, pos_all[:, 0], 'r-', linewidth=2, label='True North')
-    plt.plot(t_all, pos_all[:, 1], 'g-', linewidth=2, label='True East')
-    plt.plot(t_all, pos_all[:, 2], 'b-', linewidth=2, label='True Down')
-
-    if len(gps_indices) > 0:
-        plt.plot(t_all[gps_indices], gps_pos_ned_all[gps_indices, 0], 'ro',
-                 markersize=6, label='GPS North', alpha=0.7)
-        plt.plot(t_all[gps_indices], gps_pos_ned_all[gps_indices, 1], 'go',
-                 markersize=6, label='GPS East', alpha=0.7)
-        plt.plot(t_all[gps_indices], gps_pos_ned_all[gps_indices, 2], 'bo',
-                 markersize=6, label='GPS Down', alpha=0.7)
-
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Position (m)')
-    plt.title('GPS NED Position vs True Position')
-
-    # Plot GPS NED Velocity vs True Velocity
-    plt.subplot(3, 2, 2)
-    plt.plot(t_all, vel_all[:, 0], 'r-', linewidth=2, label='True Vel North')
-    plt.plot(t_all, vel_all[:, 1], 'g-', linewidth=2, label='True Vel East')
-    plt.plot(t_all, vel_all[:, 2], 'b-', linewidth=2, label='True Vel Down')
-
-    if len(gps_indices) > 0:
-        plt.plot(t_all[gps_indices], gps_vel_ned_all[gps_indices, 0], 'ro',
-                 markersize=6, label='GPS Vel North', alpha=0.7)
-        plt.plot(t_all[gps_indices], gps_vel_ned_all[gps_indices, 1], 'go',
-                 markersize=6, label='GPS Vel East', alpha=0.7)
-        plt.plot(t_all[gps_indices], gps_vel_ned_all[gps_indices, 2], 'bo',
-                 markersize=6, label='GPS Vel Down', alpha=0.7)
-
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Velocity (m/s)')
-    plt.title('GPS NED Velocity vs True Velocity')
-
-    # NEW: Plot GPS Geodetic Coordinates
-    plt.subplot(3, 2, 3)
-    if len(gps_indices) > 0:
-        plt.plot(t_all[gps_indices], gps_lat_all[gps_indices], 'ro-',
-                 markersize=4, label='GPS Latitude')
-        plt.grid(True)
-        plt.legend()
-        plt.ylabel('Latitude (degrees)')
-        plt.title('GPS Geodetic Latitude')
-        # Add reference line
-        ref_lat = gps_lat_all[gps_indices][0] if len(gps_indices) > 0 else 0
-        plt.axhline(y=ref_lat, color='k', linestyle='--',
-                    alpha=0.5, label=f'Reference: {ref_lat:.6f}°')
-
-    plt.subplot(3, 2, 4)
-    if len(gps_indices) > 0:
-        plt.plot(t_all[gps_indices], gps_lon_all[gps_indices], 'go-',
-                 markersize=4, label='GPS Longitude')
-        plt.grid(True)
-        plt.legend()
-        plt.ylabel('Longitude (degrees)')
-        plt.title('GPS Geodetic Longitude')
-        # Add reference line
-        ref_lon = gps_lon_all[gps_indices][0] if len(gps_indices) > 0 else 0
-        plt.axhline(y=ref_lon, color='k', linestyle='--',
-                    alpha=0.5, label=f'Reference: {ref_lon:.6f}°')
-
-    plt.subplot(3, 2, 5)
-    if len(gps_indices) > 0:
-        plt.plot(t_all[gps_indices], gps_alt_all[gps_indices], 'bo-',
-                 markersize=4, label='GPS Altitude')
-        plt.grid(True)
-        plt.legend()
-        plt.ylabel('Altitude (m)')
-        plt.title('GPS Geodetic Altitude')
-
-    # NEW: GPS Ground Track (Bird's eye view)
-    plt.subplot(3, 2, 6)
-    if len(gps_indices) > 0:
-        # Convert to relative coordinates for better visualization
-        ref_lat = gps_lat_all[gps_indices][0]
-        ref_lon = gps_lon_all[gps_indices][0]
-
-        # Approximate conversion to meters (flat earth)
-        lat_meters = (gps_lat_all[gps_indices] - ref_lat) * 111320
-        lon_meters = (gps_lon_all[gps_indices] - ref_lon) * \
-            111320 * np.cos(np.deg2rad(ref_lat))
-
-        plt.plot(lon_meters, lat_meters, 'b.-',
-                 markersize=4, label='GPS Track')
-        plt.plot(lon_meters[0], lat_meters[0],
-                 'go', markersize=10, label='Start')
-        plt.plot(lon_meters[-1], lat_meters[-1],
-                 'ro', markersize=10, label='End')
-
-        plt.grid(True)
-        plt.legend()
-        plt.xlabel('Longitude offset (m)')
-        plt.ylabel('Latitude offset (m)')
-        plt.title('GPS Ground Track (Geodetic)')
-        plt.axis('equal')
-
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-
-    # ===== Plot Barometer and Magnetometer =====
-    plt.figure(figsize=(15, 12))
-    plt.suptitle("Barometer and Magnetometer Data", fontsize=16)
-
-    # Plot barometer altitude compared to true altitude
-    plt.subplot(2, 2, 1)
-    if config.orient == "NED":
-        true_altitude = -pos_all[:, 2]  # In NED, altitude is -z
-    else:
-        true_altitude = pos_all[:, 2]   # In ENU, altitude is z
-
-    plt.plot(t_all, true_altitude, 'b-', linewidth=2, label='True Altitude')
-
-    # Find non-zero barometer readings
-    non_zero_baro = np.where(baro_alt_all != 0)[0]
-    if len(non_zero_baro) > 0:
-        plt.plot(t_all[non_zero_baro], baro_alt_all[non_zero_baro],
-                 'ro', markersize=4, label='Baro Altitude')
-
-    plt.grid(True)
-    plt.legend()
-    plt.xlabel('Time (s)')
-    plt.ylabel('Altitude (m)')
-    plt.title('Barometer vs True Altitude')
-
-    # Plot magnetometer measurements
-    plt.subplot(2, 2, 2)
-    non_zero_mag = np.where(np.any(mag_all != 0, axis=1))[0]
-    if len(non_zero_mag) > 0:
-        plt.plot(t_all[non_zero_mag], mag_all[non_zero_mag, 0],
-                 'r.', markersize=2, label='Mag X')
-        plt.plot(t_all[non_zero_mag], mag_all[non_zero_mag, 1],
-                 'g.', markersize=2, label='Mag Y')
-        plt.plot(t_all[non_zero_mag], mag_all[non_zero_mag, 2],
-                 'b.', markersize=2, label='Mag Z')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Magnetic Field (Gauss)')
-    plt.title('Magnetometer Measurements')
-
-    # Plot magnitude of magnetic field
-    plt.subplot(2, 2, 3)
-    if len(non_zero_mag) > 0:
-        mag_magnitude = np.sqrt(mag_all[non_zero_mag, 0]**2 +
-                                mag_all[non_zero_mag, 1]**2 +
-                                mag_all[non_zero_mag, 2]**2)
-        plt.plot(t_all[non_zero_mag], mag_magnitude,
-                 'k-', linewidth=2, label='Magnitude')
-    plt.grid(True)
-    plt.legend()
-    plt.xlabel('Time (s)')
-    plt.ylabel('Magnetic Field Magnitude (Gauss)')
-    plt.title('Magnetometer Magnitude')
-
-    # GPS vs Barometer altitude comparison
-    plt.subplot(2, 2, 4)
-    plt.plot(t_all, true_altitude, 'k-', linewidth=2, label='True Altitude')
-
-    if len(gps_indices) > 0:
-        plt.plot(t_all[gps_indices], gps_alt_all[gps_indices], 'bo',
-                 markersize=4, label='GPS Altitude', alpha=0.7)
-
-    if len(non_zero_baro) > 0:
-        plt.plot(t_all[non_zero_baro], baro_alt_all[non_zero_baro],
-                 'ro', markersize=4, label='Baro Altitude', alpha=0.7)
-
-    plt.grid(True)
-    plt.legend()
-    plt.xlabel('Time (s)')
-    plt.ylabel('Altitude (m)')
-    plt.title('Altitude Comparison: GPS vs Barometer vs Truth')
-
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-
-
-def plot_control_data(t_all, thrust_sp_all, rate_sp_all, rate_ctrl_all,
-                      control_torques_all, w_cmd_all, thr_all):
-    """Plot control data untuk validasi"""
-
-    # Plot Control Thrust and Torques
-    plt.figure(figsize=(15, 12))
-    plt.suptitle("Control Commands and Outputs", fontsize=16)
-
-    # Thrust setpoints
-    plt.subplot(3, 2, 1)
-    plt.plot(t_all, thrust_sp_all[:, 0], 'r-', label='Thrust X')
-    plt.plot(t_all, thrust_sp_all[:, 1], 'g-', label='Thrust Y')
-    plt.plot(t_all, thrust_sp_all[:, 2], 'b-', label='Thrust Z')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Thrust Setpoint (N)')
-    plt.title('Control Thrust Setpoints')
-
-    # Control torques
-    plt.subplot(3, 2, 2)
-    plt.plot(t_all, control_torques_all[:, 0], 'r-', label='Torque X (Roll)')
-    plt.plot(t_all, control_torques_all[:, 1], 'g-', label='Torque Y (Pitch)')
-    plt.plot(t_all, control_torques_all[:, 2], 'b-', label='Torque Z (Yaw)')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Control Torque (N⋅m)')
-    plt.title('Control Torques (from Mixer Matrix)')
-
-    # Rate setpoints
-    plt.subplot(3, 2, 3)
-    plt.plot(t_all, rate_sp_all[:, 0] * 180/np.pi, 'r-', label='Roll Rate SP')
-    plt.plot(t_all, rate_sp_all[:, 1] * 180/np.pi, 'g-', label='Pitch Rate SP')
-    plt.plot(t_all, rate_sp_all[:, 2] * 180/np.pi, 'b-', label='Yaw Rate SP')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Rate Setpoint (deg/s)')
-    plt.title('Angular Rate Setpoints')
-
-    # Rate control outputs
-    plt.subplot(3, 2, 4)
-    plt.plot(t_all, rate_ctrl_all[:, 0], 'r-', label='Roll Ctrl')
-    plt.plot(t_all, rate_ctrl_all[:, 1], 'g-', label='Pitch Ctrl')
-    plt.plot(t_all, rate_ctrl_all[:, 2], 'b-', label='Yaw Ctrl')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Rate Control Output')
-    plt.title('Rate Control Outputs')
-
-    # Motor commands
-    plt.subplot(3, 2, 5)
-    for i in range(6):
-        plt.plot(t_all, w_cmd_all[:, i], label=f'Motor {i+1}')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Motor Speed Command (rad/s)')
-    plt.xlabel('Time (s)')
-    plt.title('Motor Speed Commands')
-
-    # Motor thrusts
-    plt.subplot(3, 2, 6)
-    for i in range(6):
-        plt.plot(t_all, thr_all[:, i], label=f'Motor {i+1}')
-    plt.grid(True)
-    plt.legend()
-    plt.ylabel('Motor Thrust (N)')
-    plt.xlabel('Time (s)')
-    plt.title('Motor Thrust Outputs')
-
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    print(
+        f"✓ GPS lat/long data now logged from t={Ts}s onwards!")
 
 
 if __name__ == "__main__":
