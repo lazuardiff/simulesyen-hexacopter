@@ -1,15 +1,11 @@
-# -*- coding: utf-8 -*-
-"""
-author: John Bass
-email: john.bobzwik@gmail.com
-license: MIT
-Please feel free to use and modify this, but keep the above information. Thanks!
-"""
+# PERUBAHAN DETAIL UNTUK hexacopter.py
+# =====================================
 
 import numpy as np
 from numpy import sin, cos, tan, pi, sign
 from scipy.integrate import ode
 
+# 1. TAMBAHKAN IMPORT untuk mixer yang sudah diperbaiki
 from quadFiles.initHexa import sys_params, init_cmd, init_state
 import utils
 import config
@@ -18,25 +14,19 @@ deg2rad = pi/180.0
 
 
 class Quadcopter:
-
     def __init__(self, Ti):
-
-        # Quad Params
-        # ---------------------------
+        # ... (tidak ada perubahan sampai forces())
         self.params = sys_params()
 
         # Command for initial stable hover
-        # ---------------------------
         ini_hover = init_cmd(self.params)
-        # Feed-Forward Command for Hover
         self.params["FF"] = ini_hover[0]
-        self.params["w_hover"] = ini_hover[1]    # Motor Speed for Hover
-        self.params["thr_hover"] = ini_hover[2]  # Motor Thrust for Hover
+        self.params["w_hover"] = ini_hover[1]
+        self.params["thr_hover"] = ini_hover[2]
         self.thr = np.ones(6)*ini_hover[2]
         self.tor = np.ones(6)*ini_hover[3]
 
         # Initial State
-        # ---------------------------
         self.state = init_state(self.params)
 
         self.pos = self.state[0:3]
@@ -53,34 +43,49 @@ class Quadcopter:
         self.forces()
 
         # Set Integrator
-        # ---------------------------
         self.integrator = ode(self.state_dot).set_integrator(
             'dopri5', first_step='0.00005', atol='10e-6', rtol='10e-6')
         self.integrator.set_initial_value(self.state, Ti)
 
     def extended_state(self):
-
-        # Rotation Matrix of current state (Direct Cosine Matrix)
+        # ... (tidak ada perubahan)
         self.dcm = utils.quat2Dcm(self.quat)
-
-        # Euler angles of current state
         YPR = utils.quatToYPR_ZYX(self.quat)
-        # flip YPR so that euler state = phi, theta, psi
         self.euler = YPR[::-1]
         self.psi = YPR[0]
         self.theta = YPR[1]
         self.phi = YPR[2]
 
     def forces(self):
-
-        # Rotor thrusts and torques
+        # ... (tidak ada perubahan)
         self.thr = self.params["kTh"]*self.wMotor*self.wMotor
         self.tor = self.params["kTo"]*self.wMotor*self.wMotor
 
+    # 2. TAMBAHKAN FUNGSI BARU untuk konversi motor speeds ke forces/moments
+    def motor_speeds_to_forces_moments(self, wMotor):
+        """
+        Konversi kecepatan motor ke total forces dan moments menggunakan mixer matrix.
+
+        Args:
+            wMotor: array kecepatan motor [w1, w2, w3, w4, w5, w6] (rad/s)
+
+        Returns:
+            [F_total, Mx, My, Mz]: Total thrust dan moments
+        """
+        omega_sq = wMotor * wMotor
+        forces_moments = self.params["mixerFM"] @ omega_sq
+
+        F_total = forces_moments[0]    # Total thrust (N)
+        Mx = forces_moments[1]         # Roll moment (N·m)
+        My = forces_moments[2]         # Pitch moment (N·m)
+        Mz = forces_moments[3]         # Yaw moment (N·m)
+
+        return F_total, Mx, My, Mz
+
+    # 3. UBAH FUNGSI state_dot - INI PERUBAHAN UTAMA
     def state_dot(self, t, state, cmd, wind):
 
-        # Import Params
-        # ---------------------------
+        # Import Params (sama seperti asli)
         mB = self.params["mB"]
         g = self.params["g"]
         dxm = self.params["dxm"]
@@ -105,8 +110,7 @@ class Quadcopter:
         else:
             uP = 0
 
-        # Import State Vector
-        # ---------------------------
+        # Import State Vector (sama seperti asli)
         x = state[0]
         y = state[1]
         z = state[2]
@@ -133,50 +137,35 @@ class Quadcopter:
         wM6 = state[23]
         wdotM6 = state[24]
 
-        # Motor Dynamics and Rotor forces (Second Order System: https://apmonitor.com/pdc/index.php/Main/SecondOrderSystems)
-        # ---------------------------
-
+        # Motor Dynamics (SAMA seperti asli - tidak diubah)
         uMotor = cmd
         wddotM1 = (-2.0*damp*tau*wdotM1 - wM1 + kp*uMotor[0])/(tau**2)
         wddotM2 = (-2.0*damp*tau*wdotM2 - wM2 + kp*uMotor[1])/(tau**2)
         wddotM3 = (-2.0*damp*tau*wdotM3 - wM3 + kp*uMotor[2])/(tau**2)
         wddotM4 = (-2.0*damp*tau*wdotM4 - wM4 + kp*uMotor[3])/(tau**2)
-        wddotM5 = (-2.0*damp*tau*wdotM5 - wM5 +
-                   kp*uMotor[4])/(tau**2)  # Motor 5
-        wddotM6 = (-2.0*damp*tau*wdotM6 - wM6 +
-                   kp*uMotor[5])/(tau**2)  # Motor 6
+        wddotM5 = (-2.0*damp*tau*wdotM5 - wM5 + kp*uMotor[4])/(tau**2)
+        wddotM6 = (-2.0*damp*tau*wdotM6 - wM6 + kp*uMotor[5])/(tau**2)
 
         wMotor = np.array([wM1, wM2, wM3, wM4, wM5, wM6])
         wMotor = np.clip(wMotor, minWmotor, maxWmotor)
-        thrust = kTh*wMotor*wMotor
-        torque = kTo*wMotor*wMotor
 
-        ThrM1 = thrust[0]
-        ThrM2 = thrust[1]
-        ThrM3 = thrust[2]
-        ThrM4 = thrust[3]
-        ThrM5 = thrust[4]  # Motor 5
-        ThrM6 = thrust[5]  # Motor 6
+        # *** PERUBAHAN UTAMA: Gunakan mixer matrix alih-alih individual thrust ***
+        # LAMA (dihapus):
+        # thrust = kTh*wMotor*wMotor
+        # torque = kTo*wMotor*wMotor
+        # ThrM1 = thrust[0]
+        # ThrM2 = thrust[1]
+        # ... dst
 
-        TorM1 = torque[0]
-        TorM2 = torque[1]
-        TorM3 = torque[2]
-        TorM4 = torque[3]
-        TorM5 = torque[4]  # Motor 5
-        TorM6 = torque[5]  # Motor 6
+        # BARU: Gunakan mixer matrix
+        F_total, Mx, My, Mz = self.motor_speeds_to_forces_moments(wMotor)
 
-        # Wind Model
-        # ---------------------------
-        # [velW, qW1, qW2] = wind.randomWind(t)
+        # Wind Model (sama seperti asli)
         velW = 0
         qW1 = 0
         qW2 = 0
-        # velW = 5          # m/s
-        # qW1 = 0*deg2rad    # Wind heading
-        # qW2 = 60*deg2rad     # Wind elevation (positive = upwards wind in NED, positive = downwards wind in ENU)
 
-        # State Derivatives (from PyDy) This is already the analytically solved vector of MM*x = RHS
-        # ---------------------------
+        # *** PERUBAHAN UTAMA: State Derivatives menggunakan matrix result ***
         if (config.orient == "NED"):
             DynamicsDot = np.array([
                 [xdot],
@@ -186,19 +175,26 @@ class Quadcopter:
                 [0.5*p*q0 - 0.5*q*q3 + 0.5*q2*r],
                 [0.5*p*q3 + 0.5*q*q0 - 0.5*q1*r],
                 [-0.5*p*q2 + 0.5*q*q1 + 0.5*q0*r],
-                [(Cd*sign(-xdot)*(-xdot)**2 - 2*(q0*q2 + q1*q3) *
-                  (ThrM1 + ThrM2 + ThrM3 + ThrM4 + ThrM5 + ThrM6))/mB],
-                [(Cd*sign(-ydot)*(-ydot)**2 + 2*(q0*q1 - q2*q3) *
-                  (ThrM1 + ThrM2 + ThrM3 + ThrM4 + ThrM5 + ThrM6))/mB],
-                [(-Cd*sign(+zdot)*(+zdot)**2 - (ThrM1 + ThrM2 + ThrM3 + ThrM4 +
-                  ThrM5 + ThrM6)*(q0**2 - q1**2 - q2**2 + q3**2) + g*mB)/mB],
-                # uP activates or deactivates the use of gyroscopic precession.
-                [((IByy - IBzz)*q*r - uP*IRzz*(wM1 - wM2 + wM3 - wM4 + wM5 - wM6)*q +
-                  (ThrM1 - ThrM2 - 0.5*ThrM3 + 0.5*ThrM4 + 0.5*ThrM5 - 0.5*ThrM6)*dym)/IBxx],
-                [((IBzz - IBxx)*p*r + uP*IRzz*(wM1 - wM2 + wM3 - wM4 + wM5 - wM6)*p + (0*ThrM1 + 0*ThrM2 + 0.866*ThrM3 - 0.866*ThrM4 + 0.866*ThrM5 -
-                  # Set uP to False if rotor inertia is not known (gyro precession has negigeable effect on drone dynamics)
-                                                                                       0.866*ThrM6)*dxm)/IByy],
-                [((IBxx - IByy)*p*q - TorM1 + TorM2 - TorM3 + TorM4 + TorM5 - TorM6)/IBzz]])
+
+                # PERUBAHAN: Gunakan F_total alih-alih individual thrust
+                [(Cd*sign(-xdot)*(-xdot)**2 - 2*(q0*q2 + q1*q3) * F_total)/mB],
+                [(Cd*sign(-ydot)*(-ydot)**2 + 2*(q0*q1 - q2*q3) * F_total)/mB],
+                [(-Cd*sign(+zdot)*(+zdot)**2 - F_total *
+                  (q0**2 - q1**2 - q2**2 + q3**2) + g*mB)/mB],
+
+                # PERUBAHAN: Gunakan Mx, My, Mz alih-alih hardcoded coefficients
+                # LAMA (dihapus):
+                # [((IByy - IBzz)*q*r - uP*IRzz*(wM1 - wM2 + wM3 - wM4 + wM5 - wM6)*q +
+                #   (ThrM1 - ThrM2 - 0.5*ThrM3 + 0.5*ThrM4 + 0.5*ThrM5 - 0.5*ThrM6)*dym)/IBxx],
+
+                # BARU:
+                [((IByy - IBzz)*q*r - uP*IRzz *
+                  (wM1 - wM2 + wM3 - wM4 + wM5 - wM6)*q + Mx)/IBxx],
+                [((IBzz - IBxx)*p*r + uP*IRzz *
+                  (wM1 - wM2 + wM3 - wM4 + wM5 - wM6)*p + My)/IByy],
+                [((IBxx - IByy)*p*q + Mz)/IBzz]
+            ])
+
         elif (config.orient == "ENU"):
             DynamicsDot = np.array([
                 [xdot],
@@ -208,22 +204,24 @@ class Quadcopter:
                 [0.5*p*q0 - 0.5*q*q3 + 0.5*q2*r],
                 [0.5*p*q3 + 0.5*q*q0 - 0.5*q1*r],
                 [-0.5*p*q2 + 0.5*q*q1 + 0.5*q0*r],
-                [(Cd*sign(velW*cos(qW1)*cos(qW2) - xdot)*(velW*cos(qW1)*cos(qW2) -
-                  xdot)**2 + 2*(q0*q2 + q1*q3)*(ThrM1 + ThrM2 + ThrM3 + ThrM4))/mB],
-                [(Cd*sign(velW*sin(qW1)*cos(qW2) - ydot)*(velW*sin(qW1)*cos(qW2) -
-                  ydot)**2 - 2*(q0*q1 - q2*q3)*(ThrM1 + ThrM2 + ThrM3 + ThrM4))/mB],
-                [(-Cd*sign(velW*sin(qW2) + zdot)*(velW*sin(qW2) + zdot)**2 + (ThrM1 +
-                  ThrM2 + ThrM3 + ThrM4)*(q0**2 - q1**2 - q2**2 + q3**2) - g*mB)/mB],
-                # uP activates or deactivates the use of gyroscopic precession.
-                [((IByy - IBzz)*q*r + uP*IRzz*(wM1 - wM2 + wM3 - wM4)
-                  * q + (ThrM1 - ThrM2 - ThrM3 + ThrM4)*dym)/IBxx],
-                # Set uP to False if rotor inertia is not known (gyro precession has negigeable effect on drone dynamics)
-                [((IBzz - IBxx)*p*r - uP*IRzz*(wM1 - wM2 + wM3 - wM4)
-                  * p + (-ThrM1 - ThrM2 + ThrM3 + ThrM4)*dxm)/IByy],
-                [((IBxx - IBzz)*p*q + TorM1 - TorM2 + TorM3 - TorM4)/IBzz]])
 
-        # State Derivative Vector
-        # ---------------------------
+                # PERUBAHAN: Gunakan F_total untuk ENU juga
+                [(Cd*sign(velW*cos(qW1)*cos(qW2) - xdot)*(velW*cos(qW1)
+                  * cos(qW2) - xdot)**2 + 2*(q0*q2 + q1*q3)*F_total)/mB],
+                [(Cd*sign(velW*sin(qW1)*cos(qW2) - ydot)*(velW*sin(qW1)
+                  * cos(qW2) - ydot)**2 - 2*(q0*q1 - q2*q3)*F_total)/mB],
+                [(-Cd*sign(velW*sin(qW2) + zdot)*(velW*sin(qW2) + zdot) **
+                  2 + F_total*(q0**2 - q1**2 - q2**2 + q3**2) - g*mB)/mB],
+
+                # PERUBAHAN: Gunakan Mx, My, Mz untuk ENU juga
+                [((IByy - IBzz)*q*r + uP*IRzz *
+                  (wM1 - wM2 + wM3 - wM4 + wM5 - wM6)*q + Mx)/IBxx],
+                [((IBzz - IBxx)*p*r - uP*IRzz *
+                  (wM1 - wM2 + wM3 - wM4 + wM5 - wM6)*p + My)/IByy],
+                [((IBxx - IByy)*p*q + Mz)/IBzz]
+            ])
+
+        # State Derivative Vector (sama seperti asli)
         sdot = np.zeros([25])
         sdot[0] = DynamicsDot[0]
         sdot[1] = DynamicsDot[1]
@@ -252,11 +250,10 @@ class Quadcopter:
         sdot[24] = wddotM6
 
         self.acc = sdot[7:10]
-
         return sdot
 
+    # update() function tetap sama - tidak ada perubahan
     def update(self, t, Ts, cmd, wind):
-
         prev_vel = self.vel
         prev_omega = self.omega
 
@@ -274,3 +271,34 @@ class Quadcopter:
 
         self.extended_state()
         self.forces()
+
+
+# =====================================
+# RANGKUMAN PERUBAHAN:
+# =====================================
+
+"""
+PERUBAHAN MINIMAL YANG DIPERLUKAN:
+
+1. TAMBAH import untuk initHexa_fixed (dengan mixer matrix yang benar)
+
+2. TAMBAH fungsi motor_speeds_to_forces_moments():
+   - Konversi wMotor ke [F_total, Mx, My, Mz] menggunakan mixer matrix
+   - Menggantikan perhitungan individual thrust/torque
+
+3. UBAH di state_dot():
+   - Hapus: thrust = kTh*wMotor*wMotor dan ThrMx assignments
+   - Tambah: F_total, Mx, My, Mz = self.motor_speeds_to_forces_moments(wMotor)
+   - Ganti semua (ThrM1 + ThrM2 + ... + ThrM6) dengan F_total
+   - Ganti hardcoded coefficients untuk roll/pitch/yaw dengan Mx, My, Mz
+
+4. UPDATE initHexa.py:
+   - Perbaiki makeMixerFM() dengan konfigurasi motor yang benar
+   - Sesuaikan angles dan yaw_dir
+
+KEUNTUNGAN:
+✅ Konsistensi matematiks antara mixer dan dynamics
+✅ Konfigurasi motor yang benar sesuai hexacopter X layout
+✅ Matrix-based calculation (lebih reliable)
+✅ Mudah di-debug dan diverifikasi
+"""

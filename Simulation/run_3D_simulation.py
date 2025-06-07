@@ -6,6 +6,7 @@ license: MIT
 Please feel free to use and modify this, but keep the above information. Thanks!
 
 Enhanced version with full GPS geodetic integration
+Updated to work with fixed hexacopter mixer matrix
 """
 
 import numpy as np
@@ -157,16 +158,12 @@ def main():
 
     total_thrust_all[0] = np.linalg.norm(ctrl.thrust_sp)
 
-    # Calculate control torques
-    motor_thrusts = quad.thr
-    if len(motor_thrusts) >= 6:  # Hexacopter
-        L = quad.params.get("L", 0.225)
-        control_torques_all[0, 0] = L * (motor_thrusts[1] +
-                                         motor_thrusts[2] - motor_thrusts[4] - motor_thrusts[5])
-        control_torques_all[0, 1] = L * (motor_thrusts[0] +
-                                         motor_thrusts[1] - motor_thrusts[3] - motor_thrusts[4])
-        control_torques_all[0, 2] = quad.params["kTo"] * (
-            motor_thrusts[0] - motor_thrusts[1] + motor_thrusts[2] - motor_thrusts[3] + motor_thrusts[4] - motor_thrusts[5])
+    # ===== FIXED: Calculate control torques using mixer matrix =====
+    # Use the fixed mixer matrix instead of hardcoded coefficients
+    F_total, Mx, My, Mz = quad.motor_speeds_to_forces_moments(quad.wMotor)
+    control_torques_all[0, 0] = Mx  # Roll moment
+    control_torques_all[0, 1] = My  # Pitch moment
+    control_torques_all[0, 2] = Mz  # Yaw moment
 
     acc_body_all[0, :] = quad.dcm.T @ quad.acc
     omega_dot_all[0, :] = quad.omega_dot
@@ -265,15 +262,12 @@ def main():
         # Calculate control allocation data
         total_thrust_all[i] = np.linalg.norm(ctrl.thrust_sp)
 
-        motor_thrusts = quad.thr
-        if len(motor_thrusts) >= 6:  # Hexacopter
-            L = quad.params.get("L", 0.225)
-            control_torques_all[i, 0] = L * (motor_thrusts[1] +
-                                             motor_thrusts[2] - motor_thrusts[4] - motor_thrusts[5])
-            control_torques_all[i, 1] = L * (motor_thrusts[0] +
-                                             motor_thrusts[1] - motor_thrusts[3] - motor_thrusts[4])
-            control_torques_all[i, 2] = quad.params["kTo"] * (
-                motor_thrusts[0] - motor_thrusts[1] + motor_thrusts[2] - motor_thrusts[3] + motor_thrusts[4] - motor_thrusts[5])
+        # ===== FIXED: Calculate control torques using mixer matrix =====
+        # Replace hardcoded coefficients with mixer matrix calculation
+        F_total, Mx, My, Mz = quad.motor_speeds_to_forces_moments(quad.wMotor)
+        control_torques_all[i, 0] = Mx  # Roll moment
+        control_torques_all[i, 1] = My  # Pitch moment
+        control_torques_all[i, 2] = Mz  # Yaw moment
 
         acc_body_all[i, :] = quad.dcm.T @ quad.acc
         omega_dot_all[i, :] = quad.omega_dot
@@ -464,6 +458,15 @@ def main():
         f.write(f"Arm length: {quad.params.get('L', 'N/A')} m\n")
         f.write(f"Thrust coefficient: {quad.params['kTh']} N/(rad/s)^2\n")
         f.write(f"Torque coefficient: {quad.params['kTo']} N*m/(rad/s)^2\n")
+        f.write(f"\n=== MIXER MATRIX CONFIGURATION ===\n")
+        f.write(f"Motor Configuration: Fixed Hexacopter X\n")
+        f.write(f"Motor 1: kanan CW\n")
+        f.write(f"Motor 2: kiri CCW\n")
+        f.write(f"Motor 3: kiri atas CW\n")
+        f.write(f"Motor 4: kanan bawah CCW\n")
+        f.write(f"Motor 5: kanan atas CCW\n")
+        f.write(f"Motor 6: kiri bawah CW\n")
+        f.write(f"Mixer Matrix: Matrix-based calculation (consistent)\n")
         f.write(f"\n=== GPS DATA LOGGED ===\n")
         f.write(f"- GPS NED Position [x, y, z] (for EKF processing)\n")
         f.write(f"- GPS NED Velocity [x, y, z] (for EKF processing)\n")
@@ -503,23 +506,308 @@ def main():
     print(f"GPS measurements: {np.sum(gps_available)} points")
     print(f"GPS coordinates captured: Lat/Lon/Alt + NED position/velocity")
 
-    # View Results
-    # ---------------------------
-    utils.makeFigures(quad.params, t_all, pos_all, vel_all, quat_all, omega_all,
-                      euler_all, w_cmd_all, wMotor_all, thr_all, tor_all, sDes_traj_all, sDes_calc_all)
-    ani = utils.sameAxisAnimation(t_all, traj.wps, pos_all, quat_all,
-                                  sDes_traj_all, Ts, quad.params, traj.xyzType, traj.yawType, ifsave)
+    # Verification: Print mixer matrix info
+    print(f"\n=== MIXER MATRIX VERIFICATION ===")
+    print(f"Mixer matrix shape: {quad.params['mixerFM'].shape}")
+    print(f"Using consistent matrix-based torque calculation")
 
-    # ===== ENHANCED: Plot sensor data with geodetic GPS =====
-    plot_enhanced_sensor_data(t_all, pos_all, vel_all, acc_all, gyro_all,
-                              gps_pos_ned_all, gps_vel_ned_all, gps_lat_all,
-                              gps_lon_all, gps_alt_all, gps_available,
-                              baro_alt_all, mag_all)
+    # Test mixer consistency
+    print(f"Testing mixer consistency...")
+    test_motor_speeds = np.array(
+        [100, 100, 100, 100, 100, 100])  # Equal speeds
+    F_test, Mx_test, My_test, Mz_test = quad.motor_speeds_to_forces_moments(
+        test_motor_speeds)
+    print(
+        f"Equal motor speeds test: F={F_test:.3f}N, Mx={Mx_test:.6f}N⋅m, My={My_test:.6f}N⋅m, Mz={Mz_test:.6f}N⋅m")
+    print(f"Expected: F>0, Mx≈0, My≈0, Mz≈0 (balanced)")
 
-    plot_control_data(t_all, thrust_sp_all, rate_sp_all, rate_ctrl_all,
-                      control_torques_all, w_cmd_all, thr_all)
+    # ===== CREATE VISUALIZATION PLOTS =====
+    print("\n=== CREATING VISUALIZATION PLOTS ===")
 
-    plt.show()
+    # Create directories
+    os.makedirs('Gifs/Raw', exist_ok=True)
+
+    plot_success = False
+
+    # 1. Try simple basic plots first (always works)
+    try:
+        print("1. Creating basic simulation plots...")
+        create_basic_plots(t_all, pos_all, vel_all, euler_all, w_cmd_all, thr_all,
+                           control_torques_all, thrust_sp_all, quad)
+        plot_success = True
+        print("   ✓ Basic plots created successfully")
+    except Exception as e:
+        print(f"   ✗ Basic plots failed: {e}")
+
+    # 2. Try utils.makeFigures if available
+    try:
+        print("2. Creating detailed simulation figures...")
+        utils.makeFigures(quad.params, t_all, pos_all, vel_all, quat_all, omega_all,
+                          euler_all, w_cmd_all, wMotor_all, thr_all, tor_all, sDes_traj_all, sDes_calc_all)
+        print("   ✓ Detailed figures created successfully")
+    except Exception as e:
+        print(f"   ✗ Detailed figures failed: {e}")
+        if not plot_success:
+            print("   → Falling back to basic plots only")
+
+    # 3. Enhanced sensor plots
+    try:
+        print("3. Creating enhanced sensor plots...")
+        plot_enhanced_sensor_data(t_all, pos_all, vel_all, acc_all, gyro_all,
+                                  gps_pos_ned_all, gps_vel_ned_all, gps_lat_all,
+                                  gps_lon_all, gps_alt_all, gps_available,
+                                  baro_alt_all, mag_all)
+        print("   ✓ Sensor plots created successfully")
+    except Exception as e:
+        print(f"   ✗ Sensor plots failed: {e}")
+
+    # 4. Control data plots
+    try:
+        print("4. Creating control data plots...")
+        plot_control_data(t_all, thrust_sp_all, rate_sp_all, rate_ctrl_all,
+                          control_torques_all, w_cmd_all, thr_all)
+        print("   ✓ Control plots created successfully")
+    except Exception as e:
+        print(f"   ✗ Control plots failed: {e}")
+
+    # 5. Mixer verification plots
+    try:
+        print("5. Creating mixer verification plots...")
+        plot_mixer_verification(t_all, control_torques_all, thr_all, quad)
+        print("   ✓ Mixer verification plots created successfully")
+    except Exception as e:
+        print(f"   ✗ Mixer verification plots failed: {e}")
+
+    # 6. 3D Animation
+    ani = None
+    try:
+        print("6. Creating 3D animation...")
+        ani = utils.sameAxisAnimation(t_all, traj.wps, pos_all, quat_all,
+                                      sDes_traj_all, Ts, quad.params, traj.xyzType, traj.yawType, ifsave)
+        if ani is not None:
+            print("   ✓ 3D animation created successfully")
+        else:
+            print("   ✗ 3D animation failed to create")
+    except Exception as e:
+        print(f"   ✗ 3D animation error: {e}")
+
+    # 7. Display all plots
+    print("\n=== DISPLAYING PLOTS ===")
+    try:
+        plt.show()
+        print("✓ All plots displayed successfully")
+    except Exception as e:
+        print(f"✗ Display error: {e}")
+        try:
+            import matplotlib
+            matplotlib.use('TkAgg')  # Try different backend
+            plt.show()
+            print("✓ Plots displayed with TkAgg backend")
+        except Exception as e2:
+            print(f"✗ Could not display plots: {e2}")
+            print("   → Check matplotlib installation and backend")
+
+    print(f"\n=== SIMULATION COMPLETE ===")
+    print(f"Total simulation time: {Tf} seconds")
+    print(f"Data points: {len(t_all)}")
+    print(f"Files saved to: {log_dir}/")
+
+
+def create_basic_plots(t_all, pos_all, vel_all, euler_all, w_cmd_all, thr_all,
+                       control_torques_all, thrust_sp_all, quad):
+    """Create basic plots that should always work"""
+
+    # Main simulation results
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle('Hexacopter Simulation Results', fontsize=16)
+
+    # Position
+    axes[0, 0].plot(t_all, pos_all[:, 0], 'r-', label='X', linewidth=2)
+    axes[0, 0].plot(t_all, pos_all[:, 1], 'g-', label='Y', linewidth=2)
+    axes[0, 0].plot(t_all, pos_all[:, 2], 'b-', label='Z', linewidth=2)
+    axes[0, 0].set_xlabel('Time (s)')
+    axes[0, 0].set_ylabel('Position (m)')
+    axes[0, 0].set_title('Position')
+    axes[0, 0].grid(True)
+    axes[0, 0].legend()
+
+    # Velocity
+    axes[0, 1].plot(t_all, vel_all[:, 0], 'r-', label='Vx', linewidth=2)
+    axes[0, 1].plot(t_all, vel_all[:, 1], 'g-', label='Vy', linewidth=2)
+    axes[0, 1].plot(t_all, vel_all[:, 2], 'b-', label='Vz', linewidth=2)
+    axes[0, 1].set_xlabel('Time (s)')
+    axes[0, 1].set_ylabel('Velocity (m/s)')
+    axes[0, 1].set_title('Velocity')
+    axes[0, 1].grid(True)
+    axes[0, 1].legend()
+
+    # Euler angles
+    axes[0, 2].plot(t_all, euler_all[:, 0] * 180/np.pi,
+                    'r-', label='Roll', linewidth=2)
+    axes[0, 2].plot(t_all, euler_all[:, 1] * 180/np.pi,
+                    'g-', label='Pitch', linewidth=2)
+    axes[0, 2].plot(t_all, euler_all[:, 2] * 180/np.pi,
+                    'b-', label='Yaw', linewidth=2)
+    axes[0, 2].set_xlabel('Time (s)')
+    axes[0, 2].set_ylabel('Angle (deg)')
+    axes[0, 2].set_title('Euler Angles')
+    axes[0, 2].grid(True)
+    axes[0, 2].legend()
+
+    # Motor commands
+    colors = ['r', 'g', 'b', 'c', 'm', 'y']
+    for i in range(6):
+        axes[1, 0].plot(t_all, w_cmd_all[:, i], colors[i],
+                        label=f'Motor {i+1}', linewidth=2)
+    axes[1, 0].set_xlabel('Time (s)')
+    axes[1, 0].set_ylabel('Motor Speed (rad/s)')
+    axes[1, 0].set_title('Motor Speed Commands')
+    axes[1, 0].grid(True)
+    axes[1, 0].legend()
+
+    # Motor thrusts
+    for i in range(6):
+        axes[1, 1].plot(t_all, thr_all[:, i], colors[i],
+                        label=f'Motor {i+1}', linewidth=2)
+    axes[1, 1].set_xlabel('Time (s)')
+    axes[1, 1].set_ylabel('Thrust (N)')
+    axes[1, 1].set_title('Motor Thrusts')
+    axes[1, 1].grid(True)
+    axes[1, 1].legend()
+
+    # Control torques (from mixer matrix)
+    axes[1, 2].plot(t_all, control_torques_all[:, 0],
+                    'r-', label='Roll (Mx)', linewidth=2)
+    axes[1, 2].plot(t_all, control_torques_all[:, 1],
+                    'g-', label='Pitch (My)', linewidth=2)
+    axes[1, 2].plot(t_all, control_torques_all[:, 2],
+                    'b-', label='Yaw (Mz)', linewidth=2)
+    axes[1, 2].set_xlabel('Time (s)')
+    axes[1, 2].set_ylabel('Torque (N⋅m)')
+    axes[1, 2].set_title('Control Torques (Matrix-based)')
+    axes[1, 2].grid(True)
+    axes[1, 2].legend()
+
+    plt.tight_layout()
+
+    # Additional thrust and control plot
+    plt.figure(figsize=(15, 8))
+    plt.suptitle('Control Analysis', fontsize=16)
+
+    # Thrust setpoints
+    plt.subplot(2, 2, 1)
+    plt.plot(t_all, thrust_sp_all[:, 0], 'r-', label='Thrust X', linewidth=2)
+    plt.plot(t_all, thrust_sp_all[:, 1], 'g-', label='Thrust Y', linewidth=2)
+    plt.plot(t_all, thrust_sp_all[:, 2], 'b-', label='Thrust Z', linewidth=2)
+    plt.xlabel('Time (s)')
+    plt.ylabel('Thrust Setpoint (N)')
+    plt.title('Control Thrust Setpoints')
+    plt.grid(True)
+    plt.legend()
+
+    # Total thrust
+    total_thrust = np.linalg.norm(thrust_sp_all, axis=1)
+    plt.subplot(2, 2, 2)
+    plt.plot(t_all, total_thrust, 'k-', linewidth=2)
+    plt.xlabel('Time (s)')
+    plt.ylabel('Total Thrust (N)')
+    plt.title('Total Thrust Magnitude')
+    plt.grid(True)
+
+    # Motor balance: Left vs Right
+    plt.subplot(2, 2, 3)
+    motors_left = thr_all[:, 1] + thr_all[:, 2] + \
+        thr_all[:, 5]   # Motors 2,3,6
+    motors_right = thr_all[:, 0] + thr_all[:, 3] + \
+        thr_all[:, 4]  # Motors 1,4,5
+    plt.plot(t_all, motors_left, 'b-', label='Left (2,3,6)', linewidth=2)
+    plt.plot(t_all, motors_right, 'r-', label='Right (1,4,5)', linewidth=2)
+    plt.plot(t_all, motors_left - motors_right,
+             'g--', label='Difference', linewidth=1)
+    plt.xlabel('Time (s)')
+    plt.ylabel('Thrust Sum (N)')
+    plt.title('Motor Balance: Left vs Right')
+    plt.grid(True)
+    plt.legend()
+
+    # Motor balance: CW vs CCW
+    plt.subplot(2, 2, 4)
+    motors_cw = thr_all[:, 0] + thr_all[:, 2] + \
+        thr_all[:, 5]    # Motors 1,3,6 (CW)
+    motors_ccw = thr_all[:, 1] + thr_all[:, 3] + \
+        thr_all[:, 4]   # Motors 2,4,5 (CCW)
+    plt.plot(t_all, motors_cw, 'r-', label='CW (1,3,6)', linewidth=2)
+    plt.plot(t_all, motors_ccw, 'b-', label='CCW (2,4,5)', linewidth=2)
+    plt.plot(t_all, motors_cw - motors_ccw, 'g--',
+             label='Difference', linewidth=1)
+    plt.xlabel('Time (s)')
+    plt.ylabel('Thrust Sum (N)')
+    plt.title('Motor Balance: CW vs CCW')
+    plt.grid(True)
+    plt.legend()
+
+    plt.tight_layout()
+
+
+def plot_mixer_verification(t_all, control_torques_all, thr_all, quad):
+    """Plot untuk verifikasi mixer matrix dan control torques"""
+
+    plt.figure(figsize=(15, 10))
+    plt.suptitle("Mixer Matrix Verification", fontsize=16)
+
+    # Plot control torques dari mixer matrix
+    plt.subplot(2, 2, 1)
+    plt.plot(t_all, control_torques_all[:, 0],
+             'r-', linewidth=2, label='Roll Moment (Mx)')
+    plt.plot(t_all, control_torques_all[:, 1],
+             'g-', linewidth=2, label='Pitch Moment (My)')
+    plt.plot(t_all, control_torques_all[:, 2],
+             'b-', linewidth=2, label='Yaw Moment (Mz)')
+    plt.grid(True)
+    plt.legend()
+    plt.ylabel('Control Torque (N⋅m)')
+    plt.title('Control Torques from Mixer Matrix')
+
+    # Plot individual motor thrusts
+    plt.subplot(2, 2, 2)
+    for i in range(6):
+        plt.plot(t_all, thr_all[:, i], label=f'Motor {i+1}')
+    plt.grid(True)
+    plt.legend()
+    plt.ylabel('Motor Thrust (N)')
+    plt.title('Individual Motor Thrusts')
+
+    # Plot motor thrust balance untuk verifikasi konfigurasi
+    plt.subplot(2, 2, 3)
+    # Motor kanan vs kiri (untuk roll)
+    motors_kanan = thr_all[:, 0] + thr_all[:, 3] + \
+        thr_all[:, 4]  # Motor 1, 4, 5
+    motors_kiri = thr_all[:, 1] + thr_all[:, 2] + \
+        thr_all[:, 5]   # Motor 2, 3, 6
+    plt.plot(t_all, motors_kanan, 'r-', label='Kanan (1,4,5)')
+    plt.plot(t_all, motors_kiri, 'b-', label='Kiri (2,3,6)')
+    plt.plot(t_all, motors_kanan - motors_kiri, 'g--', label='Difference')
+    plt.grid(True)
+    plt.legend()
+    plt.ylabel('Thrust Sum (N)')
+    plt.title('Motor Thrust Balance: Kanan vs Kiri')
+
+    # Plot CW vs CCW motors untuk verifikasi yaw
+    plt.subplot(2, 2, 4)
+    motors_cw = thr_all[:, 0] + thr_all[:, 2] + \
+        thr_all[:, 5]    # Motor 1, 3, 6 (CW)
+    motors_ccw = thr_all[:, 1] + thr_all[:, 3] + \
+        thr_all[:, 4]   # Motor 2, 4, 5 (CCW)
+    plt.plot(t_all, motors_cw, 'r-', label='CW (1,3,6)')
+    plt.plot(t_all, motors_ccw, 'b-', label='CCW (2,4,5)')
+    plt.plot(t_all, motors_cw - motors_ccw, 'g--', label='Difference')
+    plt.grid(True)
+    plt.legend()
+    plt.xlabel('Time (s)')
+    plt.ylabel('Thrust Sum (N)')
+    plt.title('Motor Thrust Balance: CW vs CCW')
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
 
 
 def plot_enhanced_sensor_data(t_all, pos_all, vel_all, acc_all, gyro_all,
@@ -770,7 +1058,7 @@ def plot_control_data(t_all, thrust_sp_all, rate_sp_all, rate_ctrl_all,
     plt.grid(True)
     plt.legend()
     plt.ylabel('Control Torque (N⋅m)')
-    plt.title('Control Torques')
+    plt.title('Control Torques (from Mixer Matrix)')
 
     # Rate setpoints
     plt.subplot(3, 2, 3)

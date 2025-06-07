@@ -33,7 +33,7 @@ def sys_params():
     params["IB"] = IB
     params["invI"] = inv(IB)
     params["IRzz"] = IRzz
-    params["L"] = 0.225
+    params["L"] = 0.275
     # Include integral gains in linear velocity control
     params["useIntergral"] = bool(False)
     # params["interpYaw"] = bool(False)       # Interpolate Yaw setpoints in waypoint trajectory
@@ -70,18 +70,22 @@ def sys_params():
 def makeMixerFM(params):
     kTh = params["kTh"]
     kTo = params["kTo"]
-    L = 0.275  # arm length (meter), ganti sesuai drone Anda
+    L = params["L"]  # arm length (meter), ganti sesuai drone Anda
+    mixerFM = np.array([
+        # Thrust (semua motor berkontribusi positif)
+        [kTh, kTh, kTh, kTh, kTh, kTh],
 
-    # Sudut motor dalam radian, urut sesuai urutan fisik Anda
-    angles = np.array([90, 270, 330, 150, 30, 210]) * np.pi/180
-    # Arah putar motor: +1 (CCW), -1 (CW), sesuaikan dengan urutan motor Anda
-    yaw_dir = np.array([-1, 1, -1, 1, 1, -1])
+        # Roll moment (positif = roll kiri, negatif = roll kanan)
+        # Motor kanan (-), Motor kiri (+)
+        [-L*kTh, L*kTh, 0.5*L*kTh, -0.5*L*kTh, -0.5*L*kTh, 0.5*L*kTh],
 
-    mixerFM = np.zeros((4, 6))
-    mixerFM[0, :] = kTh  # Thrust semua motor
-    mixerFM[1, :] = L * kTh * np.sin(angles)  # Roll
-    mixerFM[2, :] = L * kTh * np.cos(angles)  # Pitch
-    mixerFM[3, :] = kTo * yaw_dir             # Yaw
+        # Pitch moment (positif = pitch up, negatif = pitch down)
+        # Motor atas (+), Motor bawah (-)
+        [0, 0, 0.866*L*kTh, -0.866*L*kTh, 0.866*L*kTh, -0.866*L*kTh],
+
+        # Yaw torque (CW negatif, CCW positif)
+        [-kTo, kTo, -kTo, kTo, kTo, -kTo]
+    ])
 
     return mixerFM
 
