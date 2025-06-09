@@ -25,6 +25,7 @@ import seaborn as sns
 from matplotlib.patches import Ellipse
 from matplotlib.animation import FuncAnimation
 from scipy import stats
+import os
 
 
 def plot_ekf_comparison(results_control, results_no_control, data, save_plots=False, output_dir="plots"):
@@ -651,6 +652,136 @@ def plot_innovation_analysis(results, data, save_plots=False, output_dir="plots"
     if save_plots:
         plt.savefig(f"{output_dir}/innovation_analysis.png",
                     dpi=300, bbox_inches='tight')
+
+
+def plot_ekf_vs_groundtruth(results, data, save_plots=False, output_dir="plots"):
+    """Plot EKF estimation results against ground truth data"""
+
+    if save_plots:
+        os.makedirs(output_dir, exist_ok=True)
+
+    # Setup plotting style
+    plt.style.use(
+        'seaborn-v0_8' if 'seaborn-v0_8' in plt.style.available else 'default')
+
+    # Get aligned timestamps
+    time = np.array(results['timestamp'])
+
+    # Get ground truth aligned with EKF results timestamps
+    true_pos = np.zeros((len(time), 3))
+    true_vel = np.zeros((len(time), 3))
+    true_att = np.zeros((len(time), 3))
+
+    for i, t in enumerate(time):
+        # Find closest timestamp in ground truth data
+        idx = np.argmin(np.abs(data['timestamp'] - t))
+
+        # Extract ground truth values
+        true_pos[i] = [
+            data.iloc[idx]['true_pos_x'],
+            data.iloc[idx]['true_pos_y'],
+            data.iloc[idx]['true_pos_z']
+        ]
+        true_vel[i] = [
+            data.iloc[idx]['true_vel_x'],
+            data.iloc[idx]['true_vel_y'],
+            data.iloc[idx]['true_vel_z']
+        ]
+        true_att[i] = [
+            data.iloc[idx]['true_roll'],
+            data.iloc[idx]['true_pitch'],
+            data.iloc[idx]['true_yaw']
+        ]
+
+    # Position plots
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+    fig.suptitle('Position Estimation vs Ground Truth', fontsize=16)
+
+    labels = ['X (North)', 'Y (East)', 'Z (Down)']
+    for i in range(3):
+        ax = axes[i]
+        ax.plot(time, true_pos[:, i], 'g-', linewidth=2, label='Ground Truth')
+        ax.plot(time, results['position'][:, i], 'b--',
+                linewidth=1.5, label='EKF Estimate')
+        ax.set_ylabel(f'Position {labels[i]} (m)')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    axes[2].set_xlabel('Time (s)')
+    plt.tight_layout()
+
+    if save_plots:
+        plt.savefig(f"{output_dir}/position_comparison.png", dpi=300)
+
+    # Attitude plots (convert to degrees for better readability)
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+    fig.suptitle('Attitude Estimation vs Ground Truth', fontsize=16)
+
+    att_labels = ['Roll', 'Pitch', 'Yaw']
+    for i in range(3):
+        ax = axes[i]
+        ax.plot(time, np.rad2deg(true_att[:, i]),
+                'g-', linewidth=2, label='Ground Truth')
+        ax.plot(time, np.rad2deg(
+            results['attitude'][:, i]), 'b--', linewidth=1.5, label='EKF Estimate')
+        ax.set_ylabel(f'{att_labels[i]} (degrees)')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    axes[2].set_xlabel('Time (s)')
+    plt.tight_layout()
+
+    if save_plots:
+        plt.savefig(f"{output_dir}/attitude_comparison.png", dpi=300)
+
+    # 3D Trajectory plot
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    ax.plot(true_pos[:, 0], true_pos[:, 1], -true_pos[:, 2],
+            'g-', linewidth=2, label='Ground Truth')
+    ax.plot(results['position'][:, 0], results['position'][:, 1], -results['position'][:, 2],
+            'b--', linewidth=1.5, label='EKF Estimate')
+
+    # Add start/end markers
+    ax.scatter(true_pos[0, 0], true_pos[0, 1], -true_pos[0, 2],
+               color='green', marker='o', s=100, label='Start')
+    ax.scatter(true_pos[-1, 0], true_pos[-1, 1], -true_pos[-1, 2],
+               color='red', marker='x', s=100, label='End')
+
+    ax.set_xlabel('North (m)')
+    ax.set_ylabel('East (m)')
+    ax.set_zlabel('Up (m)')
+    ax.set_title('3D Trajectory Comparison')
+    ax.legend()
+
+    if save_plots:
+        plt.savefig(f"{output_dir}/3d_trajectory.png", dpi=300)
+
+    plt.show()
+
+    # Calculate and display error statistics
+    pos_error = results['position'] - true_pos
+    vel_error = results['velocity'] - true_vel
+    att_error = results['attitude'] - true_att
+
+    # Handle angle wrapping for attitude errors
+    att_error = np.arctan2(np.sin(att_error), np.cos(att_error))
+
+    pos_rmse = np.sqrt(np.mean(pos_error**2, axis=0))
+    vel_rmse = np.sqrt(np.mean(vel_error**2, axis=0))
+    att_rmse = np.sqrt(np.mean(att_error**2, axis=0))
+
+    print("\n=== ERROR STATISTICS ===")
+    print(
+        f"Position RMSE [X,Y,Z]: [{pos_rmse[0]:.4f}, {pos_rmse[1]:.4f}, {pos_rmse[2]:.4f}] m")
+    print(f"Total Position RMSE: {np.linalg.norm(pos_rmse):.4f} m")
+    print(
+        f"Velocity RMSE [X,Y,Z]: [{vel_rmse[0]:.4f}, {vel_rmse[1]:.4f}, {vel_rmse[2]:.4f}] m/s")
+    print(
+        f"Attitude RMSE [R,P,Y]: [{np.rad2deg(att_rmse[0]):.3f}, {np.rad2deg(att_rmse[1]):.3f}, {np.rad2deg(att_rmse[2]):.3f}] degrees")
+
+    return fig
 
 
 if __name__ == "__main__":

@@ -1,0 +1,30 @@
+EKF HEXACOPTER MISSION PHASE PERFORMANCE SUMMARY
+============================================================
+
+Analysis timestamp: 20250609_010832
+Mission phase samples: 41001
+Mission duration: 41.000 s
+
+POSITION ESTIMATION PERFORMANCE:
+----------------------------------------
+RMSE [N,E,D]: [0.2189, 0.1066, 0.0521] m
+Total Position RMSE: 0.2490 m
+Max Position Error: 0.5695 m
+
+VELOCITY ESTIMATION PERFORMANCE:
+----------------------------------------
+RMSE [N,E,D]: [0.0470, 0.0363, 0.0130] m/s
+Total Velocity RMSE: 0.0608 m/s
+Max Velocity Error: 0.1334 m/s
+
+ATTITUDE ESTIMATION PERFORMANCE:
+----------------------------------------
+RMSE [R,P,Y]: [0.321, 0.323, 2.207] deg
+Total Attitude RMSE: 2.253 deg
+Max Attitude Error: 4.518 deg
+
+CONTROL INPUT USAGE (MISSION PHASE):
+----------------------------------------
+MOTOR_THRUSTS: 41001 samples (100.0%)
+
+Total control input utilization: 100.0%

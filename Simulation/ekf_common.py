@@ -128,29 +128,26 @@ class BaseEKF:
         self.P[9:12, 9:12] *= 0.005  # Reduced from 0.01
         self.P[12:15, 12:15] *= 0.005  # Reduced from 0.01
 
-        # Process noise matrix Q (untuk error states) - IMPROVED YAW TUNING
+        # Process noise matrix Q (untuk error states)
         self.Q = np.zeros((15, 15))
         # Position process noise
         self.Q[0:3, 0:3] = np.eye(3) * (0.01 * self.dt**2)**2
         # Velocity process noise
         self.Q[3:6, 3:6] = np.eye(3) * (0.1 * self.dt)**2
-        # Attitude process noise - REDUCED YAW PROCESS NOISE
-        # Lower yaw process noise
+        # Attitude process noise
         self.Q[6:9, 6:9] = np.diag(
             [0.005 * self.dt, 0.005 * self.dt, 0.003 * self.dt])**2
         # Acceleration bias random walk
         self.Q[9:12, 9:12] = np.eye(3) * (1e-4 * self.dt)**2
         # Gyroscope bias random walk
-        # Higher Z-axis (yaw) gyro bias noise
         gyro_bias_noise = np.array([1e-5, 1e-5, 5e-5])
         self.Q[12:15, 12:15] = np.diag(gyro_bias_noise * self.dt)**2
 
-        # Measurement noise matrices - IMPROVED MAGNETOMETER TUNING
+        # Measurement noise matrices
         self.R_gps_pos = np.eye(3) * 1.0**2   # GPS position noise
         self.R_gps_vel = np.eye(3) * 0.1**2   # GPS velocity noise
         self.R_baro = np.array([[0.5**2]])    # Barometer noise
-        # ADAPTIVE MAGNETOMETER NOISE - higher noise to account for interference
-        # Increased magnetometer noise (was 0.05)
+        # Increased magnetometer noise
         self.R_mag = np.eye(3) * 0.02**2
 
         # YAW-SPECIFIC TUNING PARAMETERS
@@ -611,3 +608,167 @@ class BaseEKF:
             'attitude_std': np.sqrt(np.diag(self.P[6:9, 6:9])),
             'prediction_mode': self.prediction_mode
         }
+
+    def predict_with_control_input(self, accel_body, gyro_body, control_data=None):
+        """
+        Enhanced prediction step with control input data
+
+        Workflow:
+        1. Validate IMU and control input data
+        2. Apply IMU-based prediction (fallback method)
+        3. Calculate physics-based prediction from control inputs
+        4. Fuse IMU and control predictions based on quality
+        5. Propagate state and covariance
+
+        Args:
+            accel_body: IMU accelerometer reading [ax, ay, az] (m/s²)
+            gyro_body: IMU gyroscope reading [gx, gy, gz] (rad/s)
+            control_data: Dictionary containing:
+                - 'motor_thrusts': [T1, T2, T3, T4, T5, T6] (N)
+                - 'thrust_sp': [Fx, Fy, Fz] (N) 
+                - 'total_thrust': scalar total thrust (N)
+                - 'control_torques': [Mx, My, Mz] (N⋅m)
+        """
+        if not self.initialized:
+            return
+
+        # === STEP 1: EXTRACT CURRENT STATE ===
+        pos = self.x[0:3]
+        vel = self.x[3:6]
+        q = self.x[6:10]
+        acc_bias = self.x[10:13]
+        gyro_bias = self.x[13:16]
+
+        # === STEP 2: CORRECT SENSOR MEASUREMENTS ===
+        accel_corrected = accel_body - acc_bias
+        gyro_corrected = gyro_body - gyro_bias
+
+        # Get current rotation matrix (body to NED)
+        R_bn = self.quaternion_to_rotation_matrix(q)
+
+        # === STEP 3: PHYSICS-BASED ACCELERATION PREDICTION ===
+        accel_physics = None
+        control_quality = 0.0
+
+        if control_data is not None:
+            # Priority 1: Individual motor thrusts (most accurate)
+            if 'motor_thrusts' in control_data and control_data['motor_thrusts'] is not None:
+                motor_thrusts = control_data['motor_thrusts']
+                total_thrust = np.sum(motor_thrusts)
+
+                if len(motor_thrusts) == 6 and self.min_thrust_threshold < total_thrust < self.max_thrust_threshold:
+                    # Check thrust distribution quality
+                    thrust_variance = np.var(motor_thrusts)
+                    thrust_mean = np.mean(motor_thrusts)
+                    thrust_cv = thrust_variance / \
+                        (thrust_mean + 1e-6)  # Coefficient of variation
+
+                    # Quality metric based on thrust consistency and magnitude
+                    control_quality = min(
+                        1.0, total_thrust / 20.0) * max(0.1, 1.0 - thrust_cv)
+
+                    accel_physics = self.dynamics.predict_acceleration_from_motor_thrusts(
+                        motor_thrusts, R_bn)
+                    self.prediction_mode = "MOTOR_THRUSTS"
+
+            # Priority 2: Control thrust vector
+            elif 'thrust_sp' in control_data and control_data['thrust_sp'] is not None:
+                thrust_sp = control_data['thrust_sp']
+                thrust_magnitude = np.linalg.norm(thrust_sp)
+
+                if thrust_magnitude > self.min_thrust_threshold:
+                    # Slightly lower quality
+                    control_quality = min(1.0, thrust_magnitude / 20.0) * 0.8
+
+                    accel_physics = self.dynamics.predict_acceleration_from_thrust_vector(
+                        thrust_sp, R_bn)
+                    self.prediction_mode = "THRUST_VECTOR"
+
+            # Priority 3: Total thrust (assume vertical)
+            elif 'total_thrust' in control_data and control_data['total_thrust'] is not None:
+                total_thrust = control_data['total_thrust']
+
+                if self.min_thrust_threshold < total_thrust < self.max_thrust_threshold:
+                    control_quality = min(
+                        1.0, total_thrust / 20.0) * 0.6  # Lower quality
+
+                    # Vertical thrust assumption
+                    thrust_body = np.array([0, 0, -total_thrust])
+                    accel_physics = self.dynamics.predict_acceleration_from_thrust_vector(
+                        thrust_body, R_bn)
+                    self.prediction_mode = "TOTAL_THRUST"
+
+        # === STEP 4: IMU-BASED ACCELERATION (BASELINE) ===
+        accel_imu = R_bn @ accel_corrected + self.g_ned
+
+        # === STEP 5: SENSOR FUSION ===
+        if accel_physics is not None and control_quality > 0.1:
+            # Adaptive fusion based on control quality
+            alpha = self.control_trust_factor * control_quality
+            accel_fused = alpha * accel_physics + (1 - alpha) * accel_imu
+            self.control_available = True
+            self.control_quality = control_quality
+        else:
+            # Fallback to IMU-only prediction
+            accel_fused = accel_imu
+            self.prediction_mode = "IMU_ONLY"
+            self.control_available = False
+            self.control_quality = 0.0
+
+        # === STEP 6: KINEMATIC INTEGRATION ===
+        # Position and velocity integration
+        vel_mid = vel + 0.5 * accel_fused * self.dt  # Midpoint integration
+        pos_new = pos + vel_mid * self.dt
+        vel_new = vel + accel_fused * self.dt
+
+        # === STEP 7: ATTITUDE INTEGRATION ===
+        omega_norm = np.linalg.norm(gyro_corrected)
+        if omega_norm > 1e-8:
+            # Rodrigues rotation formula for quaternion integration
+            axis = gyro_corrected / omega_norm
+            angle = omega_norm * self.dt
+
+            # Quaternion increment
+            dq = np.array([
+                np.cos(angle/2),
+                axis[0] * np.sin(angle/2),
+                axis[1] * np.sin(angle/2),
+                axis[2] * np.sin(angle/2)
+            ])
+
+            # Quaternion multiplication: q_new = q * dq
+            q_new = np.array([
+                q[0]*dq[0] - q[1]*dq[1] - q[2]*dq[2] - q[3]*dq[3],
+                q[0]*dq[1] + q[1]*dq[0] + q[2]*dq[3] - q[3]*dq[2],
+                q[0]*dq[2] - q[1]*dq[3] + q[2]*dq[0] + q[3]*dq[1],
+                q[0]*dq[3] + q[1]*dq[2] - q[2]*dq[1] + q[3]*dq[0]
+            ])
+        else:
+            q_new = q.copy()
+
+        # === STEP 8: UPDATE NOMINAL STATE ===
+        self.x[0:3] = pos_new
+        self.x[3:6] = vel_new
+        self.x[6:10] = self.normalize_quaternion(q_new)
+        # Biases evolve via random walk (no direct update)
+
+        # === STEP 9: ERROR STATE JACOBIAN ===
+        F = np.eye(15)
+
+        # Position error propagation
+        F[0:3, 3:6] = np.eye(3) * self.dt
+
+        # Velocity error propagation (includes control input effects)
+        F[3:6, 6:9] = -R_bn @ self.skew_symmetric(accel_corrected) * self.dt
+        F[3:6, 9:12] = -R_bn * self.dt  # Accelerometer bias coupling
+
+        # Attitude error propagation
+        F[6:9, 6:9] = np.eye(3) - self.skew_symmetric(gyro_corrected) * self.dt
+        F[6:9, 12:15] = -np.eye(3) * self.dt  # Gyroscope bias coupling
+
+        # === STEP 10: COVARIANCE PROPAGATION ===
+        self.P = F @ self.P @ F.T + self.Q
+
+        # Ensure positive definite and symmetric
+        self.P = 0.5 * (self.P + self.P.T)
+        self.P += np.eye(15) * 1e-12  # Numerical stability

@@ -152,7 +152,7 @@ def main():
     # ---------------------------
     Ti = 0
     Ts = 0.001
-    hover_duration = 3.0  # 3 seconds hovering for EKF initialization
+    hover_duration = 5.0  # 3 seconds hovering for EKF initialization
     hover_altitude = 1.0  # 1 meter hovering altitude
     mission_duration = 41  # Original mission duration
     Tf = hover_duration + mission_duration  # Total simulation time
