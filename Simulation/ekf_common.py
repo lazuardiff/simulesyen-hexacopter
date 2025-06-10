@@ -609,6 +609,29 @@ class BaseEKF:
             'prediction_mode': self.prediction_mode
         }
 
+
+class EKFWithControl(BaseEKF):
+    """
+    Extended Kalman Filter with Control Input Integration
+
+    This class enhances the base EKF by incorporating control input data
+    from the simulation to improve prediction accuracy, especially for
+    position and velocity estimation.
+    """
+
+    def __init__(self, dt=0.01):
+        super().__init__(dt)
+
+        # Control input specific parameters
+        # How much to trust control vs IMU (0-1)
+        self.control_trust_factor = 0.7
+        self.min_thrust_threshold = 0.1  # Minimum thrust to consider valid (N)
+        self.max_thrust_threshold = 100  # Maximum reasonable thrust (N)
+
+        # Control input availability tracking
+        self.control_available = False
+        self.control_quality = 0.0  # Quality metric (0-1)
+
     def predict_with_control_input(self, accel_body, gyro_body, control_data=None):
         """
         Enhanced prediction step with control input data
@@ -772,3 +795,16 @@ class BaseEKF:
         # Ensure positive definite and symmetric
         self.P = 0.5 * (self.P + self.P.T)
         self.P += np.eye(15) * 1e-12  # Numerical stability
+
+    def get_state(self):
+        """Enhanced state getter with control input information"""
+        base_state = super().get_state()
+
+        # Add control-specific information
+        base_state.update({
+            'control_available': self.control_available,
+            'control_quality': self.control_quality,
+            'control_trust_factor': self.control_trust_factor
+        })
+
+        return base_state

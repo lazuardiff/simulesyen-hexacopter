@@ -1,143 +1,326 @@
 """
-EKF Analysis for Hexacopter Mission Phase
-=========================================
+EKF with Control Input Implementation
+====================================
 
-Script untuk menganalisis hasil estimasi EKF pada mission phase hexacopter.
-- Hover phase (5 detik awal): Untuk stabilisasi EKF
-- Mission phase (setelah 5 detik): Untuk analisis performance
+This file contains the Extended Kalman Filter implementation that uses
+control input data (motor thrusts, control torques) for enhanced prediction.
 
-Author: EKF Analysis Team
+Workflow:
+1. IMU Prediction + Control Physics Model
+2. GPS Position/Velocity Updates  
+3. Barometer Altitude Updates
+4. Magnetometer Yaw Updates
+5. Control Input Validation and Fusion
+
+Author: EKF Implementation Team
 Date: 2025
 """
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-import seaborn as sns
-from datetime import datetime
-import os
-from scipy.spatial.transform import Rotation
-
-# Import EKF classes
-from ekf_with_control import EKFWithControl, run_ekf_with_control_data
-from ekf_utils import plot_ekf_vs_groundtruth
+from ekf_common import BaseEKF
 
 
-def load_and_validate_data(csv_file_path):
+class EKFWithControl(BaseEKF):
     """
-    Load dan validasi data simulasi hexacopter
-    """
-    print("📂 Loading simulation data...")
+    Extended Kalman Filter with Control Input Integration
 
+    This class enhances the base EKF by incorporating control input data
+    from the simulation to improve prediction accuracy, especially for
+    position and velocity estimation.
+    """
+
+    def __init__(self, dt=0.01):
+        super().__init__(dt)
+
+        # Control input specific parameters
+        # How much to trust control vs IMU (0-1)
+        self.control_trust_factor = 0.7
+        self.min_thrust_threshold = 0.1  # Minimum thrust to consider valid (N)
+        self.max_thrust_threshold = 100  # Maximum reasonable thrust (N)
+
+        # Control input availability tracking
+        self.control_available = False
+        self.control_quality = 0.0  # Quality metric (0-1)
+
+    def predict_with_control_input(self, accel_body, gyro_body, control_data=None):
+        """
+        Enhanced prediction step with control input data
+
+        Workflow:
+        1. Validate IMU and control input data
+        2. Apply IMU-based prediction (fallback method)
+        3. Calculate physics-based prediction from control inputs
+        4. Fuse IMU and control predictions based on quality
+        5. Propagate state and covariance
+
+        Args:
+            accel_body: IMU accelerometer reading [ax, ay, az] (m/s²)
+            gyro_body: IMU gyroscope reading [gx, gy, gz] (rad/s)
+            control_data: Dictionary containing:
+                - 'motor_thrusts': [T1, T2, T3, T4, T5, T6] (N)
+                - 'thrust_sp': [Fx, Fy, Fz] (N) 
+                - 'total_thrust': scalar total thrust (N)
+                - 'control_torques': [Mx, My, Mz] (N⋅m)
+        """
+        if not self.initialized:
+            return
+
+        # === STEP 1: EXTRACT CURRENT STATE ===
+        pos = self.x[0:3]
+        vel = self.x[3:6]
+        q = self.x[6:10]
+        acc_bias = self.x[10:13]
+        gyro_bias = self.x[13:16]
+
+        # === STEP 2: CORRECT SENSOR MEASUREMENTS ===
+        accel_corrected = accel_body - acc_bias
+        gyro_corrected = gyro_body - gyro_bias
+
+        # Get current rotation matrix (body to NED)
+        R_bn = self.quaternion_to_rotation_matrix(q)
+
+        # === STEP 3: PHYSICS-BASED ACCELERATION PREDICTION ===
+        accel_physics = None
+        control_quality = 0.0
+
+        if control_data is not None:
+            # Priority 1: Individual motor thrusts (most accurate)
+            if 'motor_thrusts' in control_data and control_data['motor_thrusts'] is not None:
+                motor_thrusts = control_data['motor_thrusts']
+                total_thrust = np.sum(motor_thrusts)
+
+                if len(motor_thrusts) == 6 and self.min_thrust_threshold < total_thrust < self.max_thrust_threshold:
+                    # Check thrust distribution quality
+                    thrust_variance = np.var(motor_thrusts)
+                    thrust_mean = np.mean(motor_thrusts)
+                    thrust_cv = thrust_variance / \
+                        (thrust_mean + 1e-6)  # Coefficient of variation
+
+                    # Quality metric based on thrust consistency and magnitude
+                    control_quality = min(
+                        1.0, total_thrust / 20.0) * max(0.1, 1.0 - thrust_cv)
+
+                    accel_physics = self.dynamics.predict_acceleration_from_motor_thrusts(
+                        motor_thrusts, R_bn)
+                    self.prediction_mode = "MOTOR_THRUSTS"
+
+            # Priority 2: Control thrust vector
+            elif 'thrust_sp' in control_data and control_data['thrust_sp'] is not None:
+                thrust_sp = control_data['thrust_sp']
+                thrust_magnitude = np.linalg.norm(thrust_sp)
+
+                if thrust_magnitude > self.min_thrust_threshold:
+                    # Slightly lower quality
+                    control_quality = min(1.0, thrust_magnitude / 20.0) * 0.8
+
+                    accel_physics = self.dynamics.predict_acceleration_from_thrust_vector(
+                        thrust_sp, R_bn)
+                    self.prediction_mode = "THRUST_VECTOR"
+
+            # Priority 3: Total thrust (assume vertical)
+            elif 'total_thrust' in control_data and control_data['total_thrust'] is not None:
+                total_thrust = control_data['total_thrust']
+
+                if self.min_thrust_threshold < total_thrust < self.max_thrust_threshold:
+                    control_quality = min(
+                        1.0, total_thrust / 20.0) * 0.6  # Lower quality
+
+                    # Vertical thrust assumption
+                    thrust_body = np.array([0, 0, -total_thrust])
+                    accel_physics = self.dynamics.predict_acceleration_from_thrust_vector(
+                        thrust_body, R_bn)
+                    self.prediction_mode = "TOTAL_THRUST"
+
+        # === STEP 4: IMU-BASED ACCELERATION (BASELINE) ===
+        accel_imu = R_bn @ accel_corrected + self.g_ned
+
+        # === STEP 5: SENSOR FUSION ===
+        if accel_physics is not None and control_quality > 0.1:
+            # Adaptive fusion based on control quality
+            alpha = self.control_trust_factor * control_quality
+            accel_fused = alpha * accel_physics + (1 - alpha) * accel_imu
+            self.control_available = True
+            self.control_quality = control_quality
+        else:
+            # Fallback to IMU-only prediction
+            accel_fused = accel_imu
+            self.prediction_mode = "IMU_ONLY"
+            self.control_available = False
+            self.control_quality = 0.0
+
+        # === STEP 6: KINEMATIC INTEGRATION ===
+        # Position and velocity integration
+        vel_mid = vel + 0.5 * accel_fused * self.dt  # Midpoint integration
+        pos_new = pos + vel_mid * self.dt
+        vel_new = vel + accel_fused * self.dt
+
+        # === STEP 7: ATTITUDE INTEGRATION ===
+        omega_norm = np.linalg.norm(gyro_corrected)
+        if omega_norm > 1e-8:
+            # Rodrigues rotation formula for quaternion integration
+            axis = gyro_corrected / omega_norm
+            angle = omega_norm * self.dt
+
+            # Quaternion increment
+            dq = np.array([
+                np.cos(angle/2),
+                axis[0] * np.sin(angle/2),
+                axis[1] * np.sin(angle/2),
+                axis[2] * np.sin(angle/2)
+            ])
+
+            # Quaternion multiplication: q_new = q * dq
+            q_new = np.array([
+                q[0]*dq[0] - q[1]*dq[1] - q[2]*dq[2] - q[3]*dq[3],
+                q[0]*dq[1] + q[1]*dq[0] + q[2]*dq[3] - q[3]*dq[2],
+                q[0]*dq[2] - q[1]*dq[3] + q[2]*dq[0] + q[3]*dq[1],
+                q[0]*dq[3] + q[1]*dq[2] - q[2]*dq[1] + q[3]*dq[0]
+            ])
+        else:
+            q_new = q.copy()
+
+        # === STEP 8: UPDATE NOMINAL STATE ===
+        self.x[0:3] = pos_new
+        self.x[3:6] = vel_new
+        self.x[6:10] = self.normalize_quaternion(q_new)
+        # Biases evolve via random walk (no direct update)
+
+        # === STEP 9: ERROR STATE JACOBIAN ===
+        F = np.eye(15)
+
+        # Position error propagation
+        F[0:3, 3:6] = np.eye(3) * self.dt
+
+        # Velocity error propagation (includes control input effects)
+        F[3:6, 6:9] = -R_bn @ self.skew_symmetric(accel_corrected) * self.dt
+        F[3:6, 9:12] = -R_bn * self.dt  # Accelerometer bias coupling
+
+        # Attitude error propagation
+        F[6:9, 6:9] = np.eye(3) - self.skew_symmetric(gyro_corrected) * self.dt
+        F[6:9, 12:15] = -np.eye(3) * self.dt  # Gyroscope bias coupling
+
+        # === STEP 10: COVARIANCE PROPAGATION ===
+        self.P = F @ self.P @ F.T + self.Q
+
+        # Ensure positive definite and symmetric
+        self.P = 0.5 * (self.P + self.P.T)
+        self.P += np.eye(15) * 1e-12  # Numerical stability
+
+    def get_state(self):
+        """Enhanced state getter with control input information"""
+        base_state = super().get_state()
+
+        # Add control-specific information
+        base_state.update({
+            'control_available': self.control_available,
+            'control_quality': self.control_quality,
+            'control_trust_factor': self.control_trust_factor
+        })
+
+        return base_state
+
+
+def run_ekf_with_control_data(csv_file_path, use_magnetometer=True, magnetic_declination=0.0):
+    """
+    Main function to run EKF with control input data
+
+    Workflow:
+    1. Load and validate simulation data
+    2. Initialize EKF with first valid sensor measurements
+    3. Process all timesteps with prediction and measurement updates
+    4. Calculate error statistics vs ground truth
+    5. Return results for analysis
+
+    Args:
+        csv_file_path: Path to simulation data CSV
+        use_magnetometer: Enable magnetometer updates for yaw
+        magnetic_declination: Local magnetic declination in degrees
+
+    Returns:
+        tuple: (ekf_instance, results_dict, raw_data)
+    """
+
+    print("\n" + "="*80)
+    print("EKF WITH CONTROL INPUT - ENHANCED PREDICTION")
+    print("="*80)
+
+    # === STEP 1: LOAD AND VALIDATE DATA ===
     try:
         data = pd.read_csv(csv_file_path)
-        print(f"✅ Data loaded successfully: {len(data)} samples")
-
-        # Basic data info
-        print(
-            f"   Time range: {data['timestamp'].min():.3f}s to {data['timestamp'].max():.3f}s")
-        print(
-            f"   Sampling frequency: ~{1/np.mean(np.diff(data['timestamp'])):.1f} Hz")
-
-        # Check flight phases
-        hover_samples = np.sum(data['flight_phase'] == 0)
-        mission_samples = np.sum(data['flight_phase'] == 1)
-        print(
-            f"   Hover phase: {hover_samples} samples ({hover_samples*0.001:.3f}s)")
-        print(
-            f"   Mission phase: {mission_samples} samples ({mission_samples*0.001:.3f}s)")
-
-        # Data quality checks
-        print("\n🔍 Data Quality Checks:")
-
-        # Check for zero data at timestamp 0.001
-        first_row = data.iloc[0]
-        if first_row['timestamp'] <= 0.001:
-            print(f"   ⚠️  First timestamp: {first_row['timestamp']:.3f}s")
-
-            # Check if critical data is zero
-            critical_zero_checks = {
-                'GPS Position': np.allclose([first_row['gps_pos_ned_x'], first_row['gps_pos_ned_y'], first_row['gps_pos_ned_z']], 0),
-                'IMU Acceleration': np.allclose([first_row['acc_x'], first_row['acc_y'], first_row['acc_z']], 0),
-                'True Position': np.allclose([first_row['true_pos_x'], first_row['true_pos_y'], first_row['true_pos_z']], 0)
-            }
-
-            for check_name, is_zero in critical_zero_checks.items():
-                status = "❌ Zero data!" if is_zero else "✅ Valid data"
-                print(f"   {status} {check_name}")
-
-        # Check data availability
-        availability_checks = {
-            'GPS': np.mean(data['gps_available'] == 1) * 100,
-            'Barometer': np.mean(data['baro_available'] == 1) * 100,
-            'Magnetometer': np.mean(data['mag_available'] == 1) * 100
-        }
-
-        print("\n📊 Sensor Availability:")
-        for sensor, availability in availability_checks.items():
-            print(f"   {sensor}: {availability:.1f}%")
-
-        return data
-
+        print(f"✅ Simulation data loaded: {len(data)} samples")
     except Exception as e:
         print(f"❌ Error loading data: {str(e)}")
         return None
 
+    # Check control data availability
+    control_columns = {
+        'motor_thrusts': ['motor_thrust_1', 'motor_thrust_2', 'motor_thrust_3',
+                          'motor_thrust_4', 'motor_thrust_5', 'motor_thrust_6'],
+        'thrust_sp': ['thrust_sp_x', 'thrust_sp_y', 'thrust_sp_z'],
+        'control_torques': ['control_torque_x', 'control_torque_y', 'control_torque_z']
+    }
 
-def run_ekf_analysis(data, magnetic_declination=0.5):
-    """
-    Jalankan EKF dengan control input pada data simulasi
-    """
-    print("\n🚁 Running EKF with Control Input...")
+    data_availability = {}
+    for key, columns in control_columns.items():
+        data_availability[key] = all(col in data.columns for col in columns)
+
+    print(f"\n📊 Control Data Availability:")
+    for key, available in data_availability.items():
+        status = "✅" if available else "❌"
+        print(f"  {status} {key}: {available}")
 
     # Calculate sampling time
     dt_mean = np.mean(np.diff(data['timestamp']))
-    print(f"   Sampling time: {dt_mean:.4f}s")
+    print(f"🕐 Sampling time: {dt_mean:.4f} s ({1/dt_mean:.1f} Hz)")
 
-    # Initialize EKF
+    # === STEP 2: INITIALIZE EKF ===
     ekf = EKFWithControl(dt=dt_mean)
     ekf.mag_declination = np.deg2rad(magnetic_declination)
+    print(f"🧭 Magnetic declination: {magnetic_declination:.1f}°")
 
-    # Find good initialization point (skip problematic first samples)
-    init_idx = find_good_init_point(data)
+    # Find initialization point with complete sensor data
+    init_idx = find_initialization_point(data)
     if init_idx is None:
-        print("❌ No suitable initialization point found!")
-        return None, None
-
-    print(
-        f"   🎯 Initialization at index {init_idx}, time {data.iloc[init_idx]['timestamp']:.3f}s")
+        print("❌ No suitable initialization data found!")
+        return None
 
     # Initialize EKF state
-    success = initialize_ekf_from_data(ekf, data.iloc[init_idx])
+    success = initialize_ekf_state(ekf, data.iloc[init_idx], use_magnetometer)
     if not success:
-        return None, None
+        print("❌ EKF initialization failed!")
+        return None
 
-    # Process all data
-    results = process_simulation_data(ekf, data)
+    # === STEP 3: PROCESS ALL DATA ===
+    results = process_all_data(ekf, data, data_availability, use_magnetometer)
 
-    print(
-        f"✅ EKF processing completed: {len(results['timestamp'])} valid estimates")
+    if len(results['timestamp']) < 100:
+        print(f"❌ Insufficient valid results: {len(results['timestamp'])}")
+        return None
 
-    return ekf, results
+    # === STEP 4: CALCULATE ERRORS AND STATISTICS ===
+    error_stats = calculate_error_statistics(results, data)
+    print_performance_summary(error_stats, results)
+
+    print("✅ EKF with control input processing completed!")
+    return ekf, results, data
 
 
-def find_good_init_point(data):
-    """
-    Cari titik inisialisasi yang baik (hindari data zero di awal)
-    """
-    min_time = 0.01  # Skip first 10ms to avoid zero data
+def find_initialization_point(data):
+    """Find optimal initialization point with complete sensor data"""
+    min_start_time = 0.1  # Skip startup period
 
     for i in range(len(data)):
         row = data.iloc[i]
 
-        if row['timestamp'] < min_time:
+        if row['timestamp'] < min_start_time:
             continue
 
-        # Check GPS availability and validity
+        # Check GPS availability
         if row['gps_available'] != 1:
             continue
 
+        # Validate GPS data
         gps_pos = np.array(
             [row['gps_pos_ned_x'], row['gps_pos_ned_y'], row['gps_pos_ned_z']])
         gps_vel = np.array(
@@ -146,258 +329,322 @@ def find_good_init_point(data):
         if np.any(np.isnan(gps_pos)) or np.any(np.isnan(gps_vel)):
             continue
 
-        # Check for zero data (problematic)
-        if np.allclose(gps_pos, 0, atol=1e-6) or np.allclose(gps_vel, 0, atol=1e-6):
-            continue
-
-        # Check IMU data
+        # Validate IMU data
         acc = np.array([row['acc_x'], row['acc_y'], row['acc_z']])
         gyro = np.array([row['gyro_x'], row['gyro_y'], row['gyro_z']])
 
         if np.any(np.isnan(acc)) or np.any(np.isnan(gyro)) or np.linalg.norm(acc) < 0.1:
             continue
 
-        # Check true data for validation
-        true_pos = np.array(
-            [row['true_pos_x'], row['true_pos_y'], row['true_pos_z']])
-        if np.allclose(true_pos, 0, atol=1e-6):
-            continue
-
+        print(
+            f"🎯 Initialization point found: index {i}, time {row['timestamp']:.3f}s")
         return i
 
     return None
 
 
-def initialize_ekf_from_data(ekf, row):
-    """
-    Inisialisasi EKF dari data row tertentu
-    """
+def initialize_ekf_state(ekf, row, use_magnetometer):
+    """Initialize EKF state with sensor data"""
     try:
-        # GPS data
         gps_pos = np.array(
             [row['gps_pos_ned_x'], row['gps_pos_ned_y'], row['gps_pos_ned_z']])
         gps_vel = np.array(
             [row['gps_vel_ned_x'], row['gps_vel_ned_y'], row['gps_vel_ned_z']])
-
-        # IMU data
         initial_acc = np.array([row['acc_x'], row['acc_y'], row['acc_z']])
         initial_gyro = np.array([row['gyro_x'], row['gyro_y'], row['gyro_z']])
 
-        # Magnetometer data
+        # Magnetometer data if available
         initial_mag = None
-        if row['mag_available'] == 1:
+        if use_magnetometer and 'mag_available' in row and row['mag_available'] == 1:
             initial_mag = np.array([row['mag_x'], row['mag_y'], row['mag_z']])
 
-        # Use ground truth quaternion for better initialization
-        true_quat = np.array([row['true_quat_w'], row['true_quat_x'],
-                             row['true_quat_y'], row['true_quat_z']])
-
-        # Initialize with ground truth yaw for best results
-        true_yaw = row['true_yaw']
+        # Use ground truth yaw for testing purposes
+        true_yaw = row['true_yaw'] if use_magnetometer else None
 
         ekf.initialize_state(gps_pos, gps_vel, initial_acc,
                              initial_gyro, initial_mag, true_yaw)
 
-        # Override with true quaternion for better stability
-        ekf.x[6:10] = ekf.normalize_quaternion(true_quat)
+        try:
+            q_gt = np.array([
+                row['true_quat_w'],
+                row['true_quat_x'],
+                row['true_quat_y'],
+                row['true_quat_z']
+            ])
+            ekf.x[6:10] = ekf.normalize_quaternion(q_gt)
+            # Sedikit turunkan kovarians attitude agar EKF “percaya”
+            ekf.P[6:9, 6:9] = np.diag([0.04, 0.04, 1.0])
+            print("✅  Ground-truth quaternion dipakai untuk inisialisasi")
+        except KeyError:
+            print("⚠️  Kolom quaternion ground-truth tidak ditemukan, lewati patch")
 
-        # Reduce attitude uncertainty since we have good initial estimate
-        # Smaller initial uncertainty
-        ekf.P[6:9, 6:9] = np.diag([0.01, 0.01, 0.5])
-
-        print("   ✅ EKF initialized with ground truth attitude")
         return True
 
     except Exception as e:
-        print(f"   ❌ Initialization failed: {str(e)}")
+        print(f"❌ Initialization error: {str(e)}")
         return False
 
 
-def process_simulation_data(ekf, data):
-    """
-    Proses semua data simulasi melalui EKF
-    """
+def process_all_data(ekf, data, data_availability, use_magnetometer):
+    """Process all simulation data through EKF"""
+    n_samples = len(data)
+    min_processing_time = 0.05
+
+    # Initialize results storage
     results = {
         'timestamp': [], 'position': [], 'velocity': [], 'attitude': [],
-        'quaternion': [], 'acc_bias': [], 'gyro_bias': [],
-        'pos_std': [], 'vel_std': [], 'att_std': [],
-        'prediction_mode': [], 'control_quality': [], 'flight_phase': []
+        'acc_bias': [], 'gyro_bias': [], 'pos_std': [], 'vel_std': [], 'att_std': [],
+        'prediction_modes': [], 'control_quality': []
     }
 
-    print(f"   🔄 Processing {len(data)} samples...")
+    # Statistics counters
+    stats = {
+        'prediction_count': 0, 'gps_updates': 0, 'baro_updates': 0,
+        'mag_updates': 0, 'control_used': 0, 'skipped_samples': 0
+    }
 
-    processed_count = 0
-    skipped_count = 0
+    print(f"🔄 Processing {n_samples} samples...")
 
-    for i, row in data.iterrows():
-        # Skip early problematic data
-        if row['timestamp'] < 0.01:
-            skipped_count += 1
+    for i in range(n_samples):
+        row = data.iloc[i]
+
+        # Skip early timestamps
+        if row['timestamp'] < min_processing_time:
+            stats['skipped_samples'] += 1
             continue
 
+        # Validate and prepare IMU data
         try:
-            # Prepare IMU data
-            accel_body = np.array([row['acc_x'], row['acc_y'], row['acc_z']])
-            gyro_body = np.array([row['gyro_x'], row['gyro_y'], row['gyro_z']])
-
-            # Validate IMU data
-            if (np.any(np.isnan(accel_body)) or np.any(np.isnan(gyro_body)) or
-                    np.linalg.norm(accel_body) < 0.1):
-                skipped_count += 1
-                continue
-
-            # Prepare control data
-            control_data = extract_control_data(row)
-
-            # EKF Prediction step
-            ekf.predict_with_control_input(accel_body, gyro_body, control_data)
-
-            # Measurement updates
-            update_measurements(ekf, row)
-
-            # Store results
-            state = ekf.get_state()
-            results['timestamp'].append(row['timestamp'])
-            results['position'].append(state['position'].copy())
-            results['velocity'].append(state['velocity'].copy())
-            results['attitude'].append(state['attitude_euler'].copy())
-            results['quaternion'].append(state['quaternion'].copy())
-            results['acc_bias'].append(state['acc_bias'].copy())
-            results['gyro_bias'].append(state['gyro_bias'].copy())
-            results['pos_std'].append(state['position_std'].copy())
-            results['vel_std'].append(state['velocity_std'].copy())
-            results['att_std'].append(state['attitude_std'].copy())
-            results['prediction_mode'].append(state['prediction_mode'])
-            results['control_quality'].append(
-                state.get('control_quality', 0.0))
-            results['flight_phase'].append(row['flight_phase'])
-
-            processed_count += 1
-
-        except Exception as e:
-            skipped_count += 1
-            if skipped_count % 1000 == 0:  # Only print occasional warnings
-                print(
-                    f"   ⚠️  Processing error at {row['timestamp']:.3f}s: {str(e)}")
+            accel_body, gyro_body = prepare_imu_data(row)
+        except ValueError:
+            stats['skipped_samples'] += 1
             continue
 
-        # Progress update
-        if processed_count % 5000 == 0 and processed_count > 0:
-            print(
-                f"      📈 Progress: {processed_count} processed, {skipped_count} skipped")
+        # Prepare control data
+        control_data = prepare_control_data(row, data_availability)
+        if control_data:
+            stats['control_used'] += 1
 
-    print(
-        f"   ✅ Processing complete: {processed_count} processed, {skipped_count} skipped")
+        # === PREDICTION STEP ===
+        try:
+            ekf.predict_with_control_input(accel_body, gyro_body, control_data)
+            stats['prediction_count'] += 1
+        except Exception as e:
+            print(f"⚠️  Prediction failed at sample {i}: {str(e)}")
+            continue
 
-    # Convert lists to numpy arrays
-    for key in ['position', 'velocity', 'attitude', 'quaternion', 'acc_bias', 'gyro_bias',
-                'pos_std', 'vel_std', 'att_std']:
-        results[key] = np.array(results[key])
+        # === MEASUREMENT UPDATES ===
+        stats['gps_updates'] += update_gps_measurements(ekf, row)
+        stats['baro_updates'] += update_barometer_measurement(ekf, row)
+
+        if use_magnetometer:
+            stats['mag_updates'] += update_magnetometer_measurement(ekf, row)
+
+        # Store results
+        try:
+            state = ekf.get_state()
+            store_results(results, row, state)
+        except Exception as e:
+            print(f"⚠️  Failed to store results at sample {i}: {str(e)}")
+            continue
+
+        # Progress indicator
+        if i % 5000 == 0 and i > 0:
+            print(f"   📈 Progress: {i}/{n_samples} ({100*i/n_samples:.1f}%)")
+
+    # Print processing statistics
+    print(f"\n📊 Processing Statistics:")
+    print(f"  ✅ Valid predictions: {stats['prediction_count']}")
+    print(f"  📡 GPS updates: {stats['gps_updates']}")
+    print(f"  🌡️  Barometer updates: {stats['baro_updates']}")
+    print(f"  🧭 Magnetometer updates: {stats['mag_updates']}")
+    print(f"  🎮 Control data used: {stats['control_used']}")
+    print(f"  ⏭️  Skipped samples: {stats['skipped_samples']}")
 
     return results
 
 
-def extract_control_data(row):
-    """
-    Extract control data dari row data
-    """
+def prepare_imu_data(row):
+    """Prepare and validate IMU data"""
+    accel_body = np.array([row['acc_x'], row['acc_y'], row['acc_z']])
+    gyro_body = np.array([row['gyro_x'], row['gyro_y'], row['gyro_z']])
+
+    # Validation
+    acc_norm = np.linalg.norm(accel_body)
+    if (np.any(np.isnan(accel_body)) or np.any(np.isnan(gyro_body)) or
+            acc_norm < 0.1 or acc_norm > 100):
+        raise ValueError("Invalid IMU data")
+
+    # Safety clipping
+    accel_body = np.clip(accel_body, -50, 50)
+    gyro_body = np.clip(gyro_body, -20, 20)
+
+    return accel_body, gyro_body
+
+
+def prepare_control_data(row, data_availability):
+    """Prepare control input data with validation"""
     control_data = {}
 
-    # Motor thrusts
-    motor_thrusts = np.array([
-        row['motor_thrust_1'], row['motor_thrust_2'], row['motor_thrust_3'],
-        row['motor_thrust_4'], row['motor_thrust_5'], row['motor_thrust_6']
-    ])
+    # Motor thrusts (highest priority)
+    if data_availability['motor_thrusts']:
+        motor_thrusts = np.array([
+            row['motor_thrust_1'], row['motor_thrust_2'], row['motor_thrust_3'],
+            row['motor_thrust_4'], row['motor_thrust_5'], row['motor_thrust_6']
+        ])
+        if (np.sum(motor_thrusts) > 0.1 and not np.any(np.isnan(motor_thrusts)) and
+                not np.allclose(motor_thrusts, 0, atol=1e-6)):
+            control_data['motor_thrusts'] = motor_thrusts
 
-    if (not np.any(np.isnan(motor_thrusts)) and np.sum(motor_thrusts) > 0.1 and
-            not np.allclose(motor_thrusts, 0, atol=1e-6)):
-        control_data['motor_thrusts'] = motor_thrusts
+    # Thrust setpoint (second priority)
+    if data_availability['thrust_sp'] and 'motor_thrusts' not in control_data:
+        thrust_sp = np.array(
+            [row['thrust_sp_x'], row['thrust_sp_y'], row['thrust_sp_z']])
+        if (np.linalg.norm(thrust_sp) > 0.1 and not np.any(np.isnan(thrust_sp)) and
+                not np.allclose(thrust_sp, 0, atol=1e-6)):
+            control_data['thrust_sp'] = thrust_sp
 
-    # Thrust setpoint
-    thrust_sp = np.array(
-        [row['thrust_sp_x'], row['thrust_sp_y'], row['thrust_sp_z']])
-    if (not np.any(np.isnan(thrust_sp)) and np.linalg.norm(thrust_sp) > 0.1 and
-            not np.allclose(thrust_sp, 0, atol=1e-6)):
-        control_data['thrust_sp'] = thrust_sp
+    # Total thrust (fallback)
+    if 'total_thrust_sp' in row and len(control_data) == 0:
+        total_thrust = row['total_thrust_sp']
+        if not np.isnan(total_thrust) and 0.1 < total_thrust < 100:
+            control_data['total_thrust'] = total_thrust
 
-    # Control torques
-    control_torques = np.array(
-        [row['control_torque_x'], row['control_torque_y'], row['control_torque_z']])
-    if (not np.any(np.isnan(control_torques)) and
-            not np.allclose(control_torques, 0, atol=1e-6)):
-        control_data['control_torques'] = control_torques
+    # Control torques (additional info)
+    if data_availability['control_torques']:
+        control_torques = np.array([
+            row['control_torque_x'], row['control_torque_y'], row['control_torque_z']
+        ])
+        if not np.any(np.isnan(control_torques)) and not np.allclose(control_torques, 0, atol=1e-6):
+            control_data['control_torques'] = control_torques
 
     return control_data if control_data else None
 
 
-def update_measurements(ekf, row):
-    """
-    Update EKF dengan measurement yang tersedia
-    """
-    # GPS updates
-    if row['gps_available'] == 1:
-        gps_pos = np.array(
-            [row['gps_pos_ned_x'], row['gps_pos_ned_y'], row['gps_pos_ned_z']])
-        gps_vel = np.array(
-            [row['gps_vel_ned_x'], row['gps_vel_ned_y'], row['gps_vel_ned_z']])
+def update_gps_measurements(ekf, row):
+    """Update GPS measurements if available"""
+    if row['gps_available'] != 1:
+        return 0
 
-        if (not np.any(np.isnan(gps_pos)) and not np.any(np.isnan(gps_vel)) and
-                not np.allclose(gps_pos, 0, atol=1e-6)):
-            ekf.update_gps_position(gps_pos)
-            ekf.update_gps_velocity(gps_vel)
+    gps_pos = np.array(
+        [row['gps_pos_ned_x'], row['gps_pos_ned_y'], row['gps_pos_ned_z']])
+    gps_vel = np.array(
+        [row['gps_vel_ned_x'], row['gps_vel_ned_y'], row['gps_vel_ned_z']])
 
-    # Barometer update
-    if row['baro_available'] == 1:
-        baro_alt = row['baro_altitude']
-        if not np.isnan(baro_alt) and abs(baro_alt) > 1e-6:
-            ekf.update_barometer(baro_alt)
+    # Validate GPS data
+    if (np.any(np.isnan(gps_pos)) or np.any(np.isnan(gps_vel)) or
+            np.allclose(gps_pos, 0, atol=1e-6) or np.linalg.norm(gps_pos) > 10000):
+        return 0
 
-    # Magnetometer update
-    if row['mag_available'] == 1:
-        mag_body = np.array([row['mag_x'], row['mag_y'], row['mag_z']])
-        if (not np.any(np.isnan(mag_body)) and np.linalg.norm(mag_body) > 0.1 and
-                not np.allclose(mag_body, 0, atol=1e-6)):
-            ekf.update_magnetometer(mag_body)
+    ekf.update_gps_position(gps_pos)
+    ekf.update_gps_velocity(gps_vel)
+    return 1
 
 
-def analyze_mission_phase_performance(results, data):
-    """
-    Analisis performance EKF hanya pada mission phase
-    """
-    print("\n📊 Mission Phase Performance Analysis...")
+def update_barometer_measurement(ekf, row):
+    """Update barometer measurement if available"""
+    if row['baro_available'] != 1:
+        return 0
 
-    # Filter untuk mission phase saja
-    mission_indices = np.array(results['flight_phase']) == 1
+    baro_alt = row['baro_altitude']
+    if np.isnan(baro_alt) or not (-1000 < baro_alt < 10000) or abs(baro_alt) <= 1e-6:
+        return 0
 
-    if np.sum(mission_indices) == 0:
-        print("❌ No mission phase data found!")
-        return None
+    ekf.update_barometer(baro_alt)
+    return 1
 
-    print(
-        f"   Mission phase samples: {np.sum(mission_indices)} / {len(mission_indices)}")
 
-    # Extract mission phase results
-    mission_results = {}
-    for key in results.keys():
-        if key in ['position', 'velocity', 'attitude', 'quaternion']:
-            mission_results[key] = results[key][mission_indices]
-        elif key == 'timestamp':
-            mission_results[key] = np.array(results[key])[mission_indices]
+def update_magnetometer_measurement(ekf, row):
+    """Update magnetometer measurement if available"""
+    if 'mag_available' not in row or row['mag_available'] != 1:
+        return 0
 
-    # Get corresponding ground truth for mission phase
-    mission_timestamps = mission_results['timestamp']
-    mission_ground_truth = get_aligned_ground_truth(data, mission_timestamps)
+    mag_body = np.array([row['mag_x'], row['mag_y'], row['mag_z']])
+    if (np.any(np.isnan(mag_body)) or np.allclose(mag_body, 0, atol=1e-6) or
+            not (0.1 < np.linalg.norm(mag_body) < 5.0)):
+        return 0
 
-    if mission_ground_truth is None:
-        print("❌ Failed to align ground truth data!")
-        return None
+    ekf.update_magnetometer(mag_body)
+    return 1
+
+
+def store_results(results, row, state):
+    """Store EKF state results"""
+    results['timestamp'].append(row['timestamp'])
+    results['position'].append(state['position'])
+    results['velocity'].append(state['velocity'])
+    results['attitude'].append(state['attitude_euler'])
+    results['acc_bias'].append(state['acc_bias'])
+    results['gyro_bias'].append(state['gyro_bias'])
+    results['pos_std'].append(state['position_std'])
+    results['vel_std'].append(state['velocity_std'])
+    results['att_std'].append(state['attitude_std'])
+    results['prediction_modes'].append(state['prediction_mode'])
+    results['control_quality'].append(state.get('control_quality', 0.0))
+
+
+def calculate_error_statistics(results, data):
+    """Calculate error statistics vs ground truth"""
+    # Convert results to numpy arrays
+    for key in ['position', 'velocity', 'attitude', 'acc_bias', 'gyro_bias', 'pos_std', 'vel_std', 'att_std']:
+        results[key] = np.array(results[key])
+
+    # Find matching ground truth data
+    valid_indices = []
+    result_timestamps = np.array(results['timestamp'])
+
+    for i, t in enumerate(data['timestamp']):
+        if t in result_timestamps:
+            # Validate ground truth data
+            row = data.iloc[i]
+            true_pos = np.array(
+                [row['true_pos_x'], row['true_pos_y'], row['true_pos_z']])
+            true_att = np.array(
+                [row['true_roll'], row['true_pitch'], row['true_yaw']])
+
+            if (not np.allclose(true_pos, 0, atol=1e-6) and
+                    not np.allclose(true_att, 0, atol=1e-6)):
+                valid_indices.append(i)
+
+    if len(valid_indices) < 50:
+        print(
+            f"⚠️  Warning: Only {len(valid_indices)} valid ground truth samples")
+
+    # Extract ground truth
+    true_pos = np.column_stack([
+        data.iloc[valid_indices]['true_pos_x'],
+        data.iloc[valid_indices]['true_pos_y'],
+        data.iloc[valid_indices]['true_pos_z']
+    ])
+    true_vel = np.column_stack([
+        data.iloc[valid_indices]['true_vel_x'],
+        data.iloc[valid_indices]['true_vel_y'],
+        data.iloc[valid_indices]['true_vel_z']
+    ])
+    true_att = np.column_stack([
+        data.iloc[valid_indices]['true_roll'],
+        data.iloc[valid_indices]['true_pitch'],
+        data.iloc[valid_indices]['true_yaw']
+    ])
+
+    # Align EKF results with ground truth
+    gt_timestamps = data.iloc[valid_indices]['timestamp'].values
+    matching_indices = []
+
+    for gt_time in gt_timestamps:
+        result_idx = np.argmin(np.abs(result_timestamps - gt_time))
+        if abs(result_timestamps[result_idx] - gt_time) < 1e-6:
+            matching_indices.append(result_idx)
 
     # Calculate errors
-    pos_error = mission_results['position'] - mission_ground_truth['position']
-    vel_error = mission_results['velocity'] - mission_ground_truth['velocity']
-    att_error = mission_results['attitude'] - mission_ground_truth['attitude']
+    pos_error = results['position'][matching_indices] - \
+        true_pos[:len(matching_indices)]
+    vel_error = results['velocity'][matching_indices] - \
+        true_vel[:len(matching_indices)]
+    att_error = results['attitude'][matching_indices] - \
+        true_att[:len(matching_indices)]
 
-    # Handle angle wrapping for attitude
+    # Handle angle wrapping
     att_error = np.arctan2(np.sin(att_error), np.cos(att_error))
 
     # Calculate RMSE
@@ -405,496 +652,77 @@ def analyze_mission_phase_performance(results, data):
     vel_rmse = np.sqrt(np.mean(vel_error**2, axis=0))
     att_rmse = np.sqrt(np.mean(att_error**2, axis=0))
 
-    # Calculate maximum errors
-    pos_max_error = np.max(np.linalg.norm(pos_error, axis=1))
-    vel_max_error = np.max(np.linalg.norm(vel_error, axis=1))
-    att_max_error = np.max(np.linalg.norm(att_error, axis=1))
-
-    # Print results
-    print(f"\n🎯 MISSION PHASE PERFORMANCE RESULTS:")
-    print("="*60)
-    print(
-        f"📍 Position RMSE [N,E,D]: [{pos_rmse[0]:.4f}, {pos_rmse[1]:.4f}, {pos_rmse[2]:.4f}] m")
-    print(f"   Total Position RMSE: {np.linalg.norm(pos_rmse):.4f} m")
-    print(f"   Maximum Position Error: {pos_max_error:.4f} m")
-    print()
-    print(
-        f"🏃 Velocity RMSE [N,E,D]: [{vel_rmse[0]:.4f}, {vel_rmse[1]:.4f}, {vel_rmse[2]:.4f}] m/s")
-    print(f"   Total Velocity RMSE: {np.linalg.norm(vel_rmse):.4f} m/s")
-    print(f"   Maximum Velocity Error: {vel_max_error:.4f} m/s")
-    print()
-    print(
-        f"🎯 Attitude RMSE [R,P,Y]: [{np.rad2deg(att_rmse[0]):.3f}, {np.rad2deg(att_rmse[1]):.3f}, {np.rad2deg(att_rmse[2]):.3f}] deg")
-    print(
-        f"   Total Attitude RMSE: {np.rad2deg(np.linalg.norm(att_rmse)):.3f} deg")
-    print(f"   Maximum Attitude Error: {np.rad2deg(att_max_error):.3f} deg")
-    print("="*60)
-
     return {
-        'mission_results': mission_results,
-        'mission_ground_truth': mission_ground_truth,
         'pos_rmse': pos_rmse,
         'vel_rmse': vel_rmse,
         'att_rmse': att_rmse,
-        'pos_error': pos_error,
-        'vel_error': vel_error,
-        'att_error': att_error,
-        'mission_indices': mission_indices
+        'valid_samples': len(matching_indices)
     }
 
 
-def get_aligned_ground_truth(data, timestamps):
-    """
-    Get ground truth data aligned dengan timestamps EKF
-    """
-    try:
-        true_pos = np.zeros((len(timestamps), 3))
-        true_vel = np.zeros((len(timestamps), 3))
-        true_att = np.zeros((len(timestamps), 3))
-        true_quat = np.zeros((len(timestamps), 4))
-
-        for i, t in enumerate(timestamps):
-            # Find closest timestamp in ground truth
-            idx = np.argmin(np.abs(data['timestamp'] - t))
-            row = data.iloc[idx]
-
-            true_pos[i] = [row['true_pos_x'],
-                           row['true_pos_y'], row['true_pos_z']]
-            true_vel[i] = [row['true_vel_x'],
-                           row['true_vel_y'], row['true_vel_z']]
-            true_att[i] = [row['true_roll'],
-                           row['true_pitch'], row['true_yaw']]
-            true_quat[i] = [row['true_quat_w'], row['true_quat_x'],
-                            row['true_quat_y'], row['true_quat_z']]
-
-        return {
-            'position': true_pos,
-            'velocity': true_vel,
-            'attitude': true_att,
-            'quaternion': true_quat
-        }
-
-    except Exception as e:
-        print(f"❌ Error aligning ground truth: {str(e)}")
-        return None
-
-
-def plot_mission_phase_results(analysis_results, save_plots=True, output_dir="mission_analysis_plots"):
-    """
-    Plot hasil analisis mission phase
-    """
-    if save_plots:
-        os.makedirs(output_dir, exist_ok=True)
-
-    mission_results = analysis_results['mission_results']
-    mission_gt = analysis_results['mission_ground_truth']
-    time = mission_results['timestamp']
-
-    # Adjust time to start from mission start (subtract hover duration)
-    mission_start_time = time[0]
-    time_adj = time - mission_start_time
-
-    print(f"\n🎨 Generating mission phase plots...")
-
-    # Set plotting style
-    plt.style.use(
-        'seaborn-v0_8' if 'seaborn-v0_8' in plt.style.available else 'default')
-    colors = {'ekf': '#2E86AB', 'truth': '#F18F01', 'error': '#A23B72'}
-
-    # === PLOT 1: Position Estimation ===
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
-    fig.suptitle('Mission Phase: Position Estimation vs Ground Truth',
-                 fontsize=16, fontweight='bold')
-
-    pos_labels = ['North (X)', 'East (Y)', 'Down (Z)']
-    for i in range(3):
-        ax = axes[i]
-        ax.plot(time_adj, mission_gt['position'][:, i], color=colors['truth'],
-                linewidth=2.5, label='Ground Truth', alpha=0.9)
-        ax.plot(time_adj, mission_results['position'][:, i], color=colors['ekf'],
-                linewidth=2, label='EKF Estimate', linestyle='--', alpha=0.8)
-
-        ax.set_ylabel(f'Position {pos_labels[i]} (m)', fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-
-        # Add RMSE info
-        rmse = np.sqrt(
-            np.mean((mission_results['position'][:, i] - mission_gt['position'][:, i])**2))
-        ax.text(0.02, 0.98, f'RMSE: {rmse:.4f}m', transform=ax.transAxes,
-                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-
-    axes[-1].set_xlabel('Mission Time (s)', fontweight='bold')
-    plt.tight_layout()
-
-    if save_plots:
-        plt.savefig(f"{output_dir}/mission_position_estimation.png",
-                    dpi=300, bbox_inches='tight')
-
-    # === PLOT 2: Velocity Estimation ===
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
-    fig.suptitle('Mission Phase: Velocity Estimation vs Ground Truth',
-                 fontsize=16, fontweight='bold')
-
-    for i in range(3):
-        ax = axes[i]
-        ax.plot(time_adj, mission_gt['velocity'][:, i], color=colors['truth'],
-                linewidth=2.5, label='Ground Truth', alpha=0.9)
-        ax.plot(time_adj, mission_results['velocity'][:, i], color=colors['ekf'],
-                linewidth=2, label='EKF Estimate', linestyle='--', alpha=0.8)
-
-        ax.set_ylabel(f'Velocity {pos_labels[i]} (m/s)', fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-
-        # Add RMSE info
-        rmse = np.sqrt(
-            np.mean((mission_results['velocity'][:, i] - mission_gt['velocity'][:, i])**2))
-        ax.text(0.02, 0.98, f'RMSE: {rmse:.4f}m/s', transform=ax.transAxes,
-                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-
-    axes[-1].set_xlabel('Mission Time (s)', fontweight='bold')
-    plt.tight_layout()
-
-    if save_plots:
-        plt.savefig(f"{output_dir}/mission_velocity_estimation.png",
-                    dpi=300, bbox_inches='tight')
-
-    # === PLOT 3: Attitude Estimation ===
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
-    fig.suptitle('Mission Phase: Attitude Estimation vs Ground Truth',
-                 fontsize=16, fontweight='bold')
-
-    att_labels = ['Roll', 'Pitch', 'Yaw']
-    for i in range(3):
-        ax = axes[i]
-        ax.plot(time_adj, np.rad2deg(mission_gt['attitude'][:, i]), color=colors['truth'],
-                linewidth=2.5, label='Ground Truth', alpha=0.9)
-        ax.plot(time_adj, np.rad2deg(mission_results['attitude'][:, i]), color=colors['ekf'],
-                linewidth=2, label='EKF Estimate', linestyle='--', alpha=0.8)
-
-        ax.set_ylabel(f'{att_labels[i]} (degrees)', fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-
-        # Add RMSE info
-        att_error = mission_results['attitude'][:,
-                                                i] - mission_gt['attitude'][:, i]
-        att_error = np.arctan2(
-            np.sin(att_error), np.cos(att_error))  # Wrap angles
-        rmse = np.sqrt(np.mean(att_error**2))
-        ax.text(0.02, 0.98, f'RMSE: {np.rad2deg(rmse):.3f}°', transform=ax.transAxes,
-                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-
-    axes[-1].set_xlabel('Mission Time (s)', fontweight='bold')
-    plt.tight_layout()
-
-    if save_plots:
-        plt.savefig(f"{output_dir}/mission_attitude_estimation.png",
-                    dpi=300, bbox_inches='tight')
-
-    # === PLOT 4: 3D Trajectory ===
-    fig = plt.figure(figsize=(15, 12))
-
-    # 3D plot
-    ax1 = fig.add_subplot(221, projection='3d')
-    ax1.plot(mission_gt['position'][:, 0], mission_gt['position'][:, 1], -mission_gt['position'][:, 2],
-             color=colors['truth'], linewidth=3, label='Ground Truth', alpha=0.8)
-    ax1.plot(mission_results['position'][:, 0], mission_results['position'][:, 1], -mission_results['position'][:, 2],
-             color=colors['ekf'], linewidth=2, label='EKF Estimate', linestyle='--', alpha=0.7)
-
-    # Add start/end markers
-    ax1.scatter(mission_gt['position'][0, 0], mission_gt['position'][0, 1], -mission_gt['position'][0, 2],
-                color='green', marker='o', s=100, label='Start')
-    ax1.scatter(mission_gt['position'][-1, 0], mission_gt['position'][-1, 1], -mission_gt['position'][-1, 2],
-                color='red', marker='x', s=100, label='End')
-
-    ax1.set_xlabel('North (m)')
-    ax1.set_ylabel('East (m)')
-    ax1.set_zlabel('Up (m)')
-    ax1.set_title('3D Mission Trajectory')
-    ax1.legend()
-
-    # Top view (X-Y plane)
-    ax2 = fig.add_subplot(222)
-    ax2.plot(mission_gt['position'][:, 0], mission_gt['position'][:, 1],
-             color=colors['truth'], linewidth=3, label='Ground Truth', alpha=0.8)
-    ax2.plot(mission_results['position'][:, 0], mission_results['position'][:, 1],
-             color=colors['ekf'], linewidth=2, label='EKF Estimate', linestyle='--', alpha=0.7)
-    ax2.scatter(mission_gt['position'][0, 0], mission_gt['position'][0, 1],
-                color='green', marker='o', s=100, label='Start')
-    ax2.scatter(mission_gt['position'][-1, 0], mission_gt['position'][-1, 1],
-                color='red', marker='x', s=100, label='End')
-    ax2.set_xlabel('North (m)')
-    ax2.set_ylabel('East (m)')
-    ax2.set_title('Mission Trajectory (Top View)')
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
-    ax2.axis('equal')
-
-    # Position error magnitude over time
-    ax3 = fig.add_subplot(223)
-    pos_error_norm = np.linalg.norm(analysis_results['pos_error'], axis=1)
-    ax3.plot(time_adj, pos_error_norm,
-             color=colors['error'], linewidth=2, alpha=0.8)
-    ax3.set_xlabel('Mission Time (s)')
-    ax3.set_ylabel('Position Error Magnitude (m)')
-    ax3.set_title('Position Error vs Time')
-    ax3.grid(True, alpha=0.3)
-
-    # Error statistics summary
-    ax4 = fig.add_subplot(224)
-    error_labels = ['Pos X', 'Pos Y', 'Pos Z', 'Vel X',
-                    'Vel Y', 'Vel Z', 'Roll', 'Pitch', 'Yaw']
-    rmse_values = np.concatenate([
-        analysis_results['pos_rmse'],
-        analysis_results['vel_rmse'],
-        np.rad2deg(analysis_results['att_rmse'])
-    ])
-
-    bars = ax4.bar(range(len(error_labels)), rmse_values, alpha=0.7)
-    ax4.set_xticks(range(len(error_labels)))
-    ax4.set_xticklabels(error_labels, rotation=45)
-    ax4.set_ylabel('RMSE')
-    ax4.set_title('Mission Phase RMSE Summary')
-    ax4.grid(True, alpha=0.3)
-
-    # Add value labels on bars
-    for i, (bar, val) in enumerate(zip(bars, rmse_values)):
-        height = bar.get_height()
-        if i < 6:  # Position and velocity
-            ax4.text(bar.get_x() + bar.get_width()/2., height + height*0.01,
-                     f'{val:.3f}', ha='center', va='bottom', fontsize=8)
-        else:  # Attitude
-            ax4.text(bar.get_x() + bar.get_width()/2., height + height*0.01,
-                     f'{val:.2f}°', ha='center', va='bottom', fontsize=8)
-
-    plt.tight_layout()
-
-    if save_plots:
-        plt.savefig(f"{output_dir}/mission_trajectory_analysis.png",
-                    dpi=300, bbox_inches='tight')
-
-    plt.show()
-    print(f"✅ Mission phase plots saved to {output_dir}/")
-
-
-def save_ekf_results(results, analysis_results, output_dir="ekf_results"):
-    """
-    Simpan hasil estimasi EKF ke file
-    """
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # === SAVE 1: Complete EKF Results ===
-    results_df = pd.DataFrame({
-        'timestamp': results['timestamp'],
-        'flight_phase': results['flight_phase'],
-
-        # Position estimates
-        'ekf_pos_x': results['position'][:, 0],
-        'ekf_pos_y': results['position'][:, 1],
-        'ekf_pos_z': results['position'][:, 2],
-
-        # Velocity estimates
-        'ekf_vel_x': results['velocity'][:, 0],
-        'ekf_vel_y': results['velocity'][:, 1],
-        'ekf_vel_z': results['velocity'][:, 2],
-
-        # Attitude estimates (Euler angles)
-        'ekf_roll': results['attitude'][:, 0],
-        'ekf_pitch': results['attitude'][:, 1],
-        'ekf_yaw': results['attitude'][:, 2],
-
-        # Quaternion estimates
-        'ekf_quat_w': results['quaternion'][:, 0],
-        'ekf_quat_x': results['quaternion'][:, 1],
-        'ekf_quat_y': results['quaternion'][:, 2],
-        'ekf_quat_z': results['quaternion'][:, 3],
-
-        # Bias estimates
-        'ekf_acc_bias_x': results['acc_bias'][:, 0],
-        'ekf_acc_bias_y': results['acc_bias'][:, 1],
-        'ekf_acc_bias_z': results['acc_bias'][:, 2],
-        'ekf_gyro_bias_x': results['gyro_bias'][:, 0],
-        'ekf_gyro_bias_y': results['gyro_bias'][:, 1],
-        'ekf_gyro_bias_z': results['gyro_bias'][:, 2],
-
-        # Uncertainty estimates
-        'ekf_pos_std_x': results['pos_std'][:, 0],
-        'ekf_pos_std_y': results['pos_std'][:, 1],
-        'ekf_pos_std_z': results['pos_std'][:, 2],
-        'ekf_vel_std_x': results['vel_std'][:, 0],
-        'ekf_vel_std_y': results['vel_std'][:, 1],
-        'ekf_vel_std_z': results['vel_std'][:, 2],
-        'ekf_att_std_roll': results['att_std'][:, 0],
-        'ekf_att_std_pitch': results['att_std'][:, 1],
-        'ekf_att_std_yaw': results['att_std'][:, 2],
-
-        # Control information
-        'prediction_mode': results['prediction_mode'],
-        'control_quality': results['control_quality']
-    })
-
-    results_file = os.path.join(
-        output_dir, f"ekf_complete_results_{timestamp}.csv")
-    results_df.to_csv(results_file, index=False)
-    print(f"✅ Complete EKF results saved: {results_file}")
-
-    # === SAVE 2: Mission Phase Only Results ===
-    if analysis_results is not None:
-        mission_results = analysis_results['mission_results']
-        mission_gt = analysis_results['mission_ground_truth']
-
-        mission_df = pd.DataFrame({
-            'mission_time': mission_results['timestamp'] - mission_results['timestamp'][0],
-            'timestamp': mission_results['timestamp'],
-
-            # EKF estimates
-            'ekf_pos_x': mission_results['position'][:, 0],
-            'ekf_pos_y': mission_results['position'][:, 1],
-            'ekf_pos_z': mission_results['position'][:, 2],
-            'ekf_vel_x': mission_results['velocity'][:, 0],
-            'ekf_vel_y': mission_results['velocity'][:, 1],
-            'ekf_vel_z': mission_results['velocity'][:, 2],
-            'ekf_roll': mission_results['attitude'][:, 0],
-            'ekf_pitch': mission_results['attitude'][:, 1],
-            'ekf_yaw': mission_results['attitude'][:, 2],
-
-            # Ground truth
-            'true_pos_x': mission_gt['position'][:, 0],
-            'true_pos_y': mission_gt['position'][:, 1],
-            'true_pos_z': mission_gt['position'][:, 2],
-            'true_vel_x': mission_gt['velocity'][:, 0],
-            'true_vel_y': mission_gt['velocity'][:, 1],
-            'true_vel_z': mission_gt['velocity'][:, 2],
-            'true_roll': mission_gt['attitude'][:, 0],
-            'true_pitch': mission_gt['attitude'][:, 1],
-            'true_yaw': mission_gt['attitude'][:, 2],
-
-            # Errors
-            'pos_error_x': analysis_results['pos_error'][:, 0],
-            'pos_error_y': analysis_results['pos_error'][:, 1],
-            'pos_error_z': analysis_results['pos_error'][:, 2],
-            'vel_error_x': analysis_results['vel_error'][:, 0],
-            'vel_error_y': analysis_results['vel_error'][:, 1],
-            'vel_error_z': analysis_results['vel_error'][:, 2],
-            'att_error_roll': analysis_results['att_error'][:, 0],
-            'att_error_pitch': analysis_results['att_error'][:, 1],
-            'att_error_yaw': analysis_results['att_error'][:, 2],
-        })
-
-        mission_file = os.path.join(
-            output_dir, f"ekf_mission_phase_results_{timestamp}.csv")
-        mission_df.to_csv(mission_file, index=False)
-        print(f"✅ Mission phase results saved: {mission_file}")
-
-        # === SAVE 3: Performance Summary ===
-        summary_file = os.path.join(
-            output_dir, f"ekf_performance_summary_{timestamp}.txt")
-        with open(summary_file, 'w') as f:
-            f.write("EKF HEXACOPTER MISSION PHASE PERFORMANCE SUMMARY\n")
-            f.write("="*60 + "\n\n")
-            f.write(f"Analysis timestamp: {timestamp}\n")
-            f.write(
-                f"Mission phase samples: {len(mission_results['timestamp'])}\n")
-            f.write(
-                f"Mission duration: {mission_results['timestamp'][-1] - mission_results['timestamp'][0]:.3f} s\n\n")
-
-            f.write("POSITION ESTIMATION PERFORMANCE:\n")
-            f.write("-"*40 + "\n")
-            f.write(
-                f"RMSE [N,E,D]: [{analysis_results['pos_rmse'][0]:.4f}, {analysis_results['pos_rmse'][1]:.4f}, {analysis_results['pos_rmse'][2]:.4f}] m\n")
-            f.write(
-                f"Total Position RMSE: {np.linalg.norm(analysis_results['pos_rmse']):.4f} m\n")
-            f.write(
-                f"Max Position Error: {np.max(np.linalg.norm(analysis_results['pos_error'], axis=1)):.4f} m\n\n")
-
-            f.write("VELOCITY ESTIMATION PERFORMANCE:\n")
-            f.write("-"*40 + "\n")
-            f.write(
-                f"RMSE [N,E,D]: [{analysis_results['vel_rmse'][0]:.4f}, {analysis_results['vel_rmse'][1]:.4f}, {analysis_results['vel_rmse'][2]:.4f}] m/s\n")
-            f.write(
-                f"Total Velocity RMSE: {np.linalg.norm(analysis_results['vel_rmse']):.4f} m/s\n")
-            f.write(
-                f"Max Velocity Error: {np.max(np.linalg.norm(analysis_results['vel_error'], axis=1)):.4f} m/s\n\n")
-
-            f.write("ATTITUDE ESTIMATION PERFORMANCE:\n")
-            f.write("-"*40 + "\n")
-            f.write(
-                f"RMSE [R,P,Y]: [{np.rad2deg(analysis_results['att_rmse'][0]):.3f}, {np.rad2deg(analysis_results['att_rmse'][1]):.3f}, {np.rad2deg(analysis_results['att_rmse'][2]):.3f}] deg\n")
-            f.write(
-                f"Total Attitude RMSE: {np.rad2deg(np.linalg.norm(analysis_results['att_rmse'])):.3f} deg\n")
-            f.write(
-                f"Max Attitude Error: {np.rad2deg(np.max(np.linalg.norm(analysis_results['att_error'], axis=1))):.3f} deg\n\n")
-
-            # Control usage statistics
-            mission_indices = analysis_results['mission_indices']
-            mission_modes = np.array(results['prediction_mode'])[
-                mission_indices]
-
-            f.write("CONTROL INPUT USAGE (MISSION PHASE):\n")
-            f.write("-"*40 + "\n")
-            mode_counts = {}
-            for mode in mission_modes:
-                mode_counts[mode] = mode_counts.get(mode, 0) + 1
-
-            for mode, count in mode_counts.items():
-                percentage = 100 * count / len(mission_modes)
-                f.write(f"{mode}: {count} samples ({percentage:.1f}%)\n")
-
-            control_usage = sum(
-                1 for mode in mission_modes if mode != "IMU_ONLY") / len(mission_modes) * 100
-            f.write(
-                f"\nTotal control input utilization: {control_usage:.1f}%\n")
-
-        print(f"✅ Performance summary saved: {summary_file}")
-
-    print(f"\n📁 All results saved to directory: {output_dir}/")
-
-
-def main():
-    """
-    Main function untuk analisis EKF mission phase
-    """
-    print("🚁 HEXACOPTER EKF MISSION PHASE ANALYSIS")
-    print("="*80)
-
-    # Specify your CSV file path here
-    csv_file_path = input(
-        "Enter CSV file path (or press Enter for default): ").strip()
-    if not csv_file_path:
-        csv_file_path = "logs/hexacopter_ekf_data_with_hovering_fixed_20250609_002136.csv"
-
-    # Load and validate data
-    data = load_and_validate_data(csv_file_path)
-    if data is None:
-        return
-
-    # Run EKF analysis
-    ekf, results = run_ekf_analysis(
-        data, magnetic_declination=0.5)  # Surabaya declination
-    if results is None:
-        return
-
-    # Analyze mission phase performance
-    analysis_results = analyze_mission_phase_performance(results, data)
-    if analysis_results is None:
-        return
-
-    # Plot results
-    plot_mission_phase_results(analysis_results, save_plots=True)
-
-    # Save results
-    save_ekf_results(results, analysis_results)
-
-    print("\n✅ Analysis completed successfully!")
-    print("   📊 Mission phase performance calculated")
-    print("   📈 Plots generated and saved")
-    print("   💾 Results saved to files")
+def print_performance_summary(error_stats, results):
+    """Print comprehensive performance summary"""
+    pos_rmse = error_stats['pos_rmse']
+    vel_rmse = error_stats['vel_rmse']
+    att_rmse = error_stats['att_rmse']
+
+    print(f"\n🎯 PERFORMANCE SUMMARY (Control Input Enhanced)")
+    print("="*60)
+
+    print(
+        f"📍 Position RMSE [X,Y,Z]: [{pos_rmse[0]:.4f}, {pos_rmse[1]:.4f}, {pos_rmse[2]:.4f}] m")
+    print(f"   Total Position RMSE: {np.linalg.norm(pos_rmse):.4f} m")
+
+    print(
+        f"🏃 Velocity RMSE [X,Y,Z]: [{vel_rmse[0]:.4f}, {vel_rmse[1]:.4f}, {vel_rmse[2]:.4f}] m/s")
+    print(f"   Total Velocity RMSE: {np.linalg.norm(vel_rmse):.4f} m/s")
+
+    print(
+        f"🎯 Attitude RMSE [R,P,Y]: [{np.rad2deg(att_rmse[0]):.3f}, {np.rad2deg(att_rmse[1]):.3f}, {np.rad2deg(att_rmse[2]):.3f}] deg")
+
+    # Control input analysis
+    if 'control_quality' in results:
+        control_quality = np.array(results['control_quality'])
+        avg_quality = np.mean(control_quality[control_quality > 0])
+        control_usage = np.sum(control_quality > 0.1) / \
+            len(control_quality) * 100
+
+        print(f"\n🎮 Control Input Analysis:")
+        print(f"   Average control quality: {avg_quality:.3f}")
+        print(f"   Control usage: {control_usage:.1f}% of samples")
+
+    # Prediction mode distribution
+    modes = results['prediction_modes']
+    mode_counts = {}
+    for mode in modes:
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
+
+    print(f"\n🔄 Prediction Mode Distribution:")
+    for mode, count in mode_counts.items():
+        percentage = 100 * count / len(modes)
+        print(f"   {mode}: {count} samples ({percentage:.1f}%)")
+
+    print("="*60)
 
 
 if __name__ == "__main__":
-    main()
+    # Example usage
+    csv_file_path = "logs/complete_flight_data_with_geodetic_20250530_183803.csv"
+
+    try:
+        results = run_ekf_with_control_data(
+            csv_file_path,
+            use_magnetometer=True,
+            magnetic_declination=0.5  # Surabaya
+        )
+
+        if results is not None:
+            ekf, results_data, data = results
+            print("✅ EKF with control input completed successfully!")
+        else:
+            print("❌ EKF processing failed!")
+
+    except Exception as e:
+        print(f"❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
