@@ -866,7 +866,7 @@ def main():
     csv_file_path = input(
         "Enter CSV file path (or press Enter for default): ").strip()
     if not csv_file_path:
-        csv_file_path = "logs/hexacopter_ekf_data_with_hovering_fixed_20250609_002136.csv"
+        csv_file_path = "logs/imu_gps_magneto_revision_20250614_105729.csv"
 
     # Load and validate data
     data = load_and_validate_data(csv_file_path)

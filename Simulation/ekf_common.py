@@ -152,7 +152,7 @@ class BaseEKF:
 
         # YAW-SPECIFIC TUNING PARAMETERS
         self.yaw_innovation_gate = 8.0        # Larger gate for yaw innovations
-        self.mag_declination = 0.0            # Magnetic declination for your location
+        self.mag_declination = 0.5            # Magnetic declination for your location
         self.enable_mag_bias_learning = True  # Enable magnetometer bias learning
         self.mag_bias = np.zeros(3)           # Magnetometer bias estimate
         self.mag_bias_P = np.eye(3) * 0.01    # Magnetometer bias covariance
