@@ -19,6 +19,7 @@ Date: 2025
 import numpy as np
 import pandas as pd
 from ekf_common import BaseEKF
+import matplotlib.pyplot as plt
 
 
 class EKFWithControl(BaseEKF):
@@ -80,80 +81,66 @@ class EKFWithControl(BaseEKF):
         # Get current rotation matrix (body to NED)
         R_bn = self.quaternion_to_rotation_matrix(q)
 
-        # === STEP 3: PHYSICS-BASED ACCELERATION PREDICTION ===
-        accel_physics = None
-        control_quality = 0.0
+        # # === STEP 3: PHYSICS-BASED ACCELERATION PREDICTION ===
+        # accel_physics = None
+        # control_quality = 0.0
 
-        if control_data is not None:
-            # Priority 1: Individual motor thrusts (most accurate)
-            if 'motor_thrusts' in control_data and control_data['motor_thrusts'] is not None:
-                motor_thrusts = control_data['motor_thrusts']
-                total_thrust = np.sum(motor_thrusts)
+        # if control_data is not None:
+        #     # Priority 1: Individual motor thrusts (most accurate)
+        #     if 'motor_thrusts' in control_data and control_data['motor_thrusts'] is not None:
+        #         motor_thrusts = control_data['motor_thrusts']
+        #         total_thrust = np.sum(motor_thrusts)
 
-                if len(motor_thrusts) == 6 and self.min_thrust_threshold < total_thrust < self.max_thrust_threshold:
-                    # Check thrust distribution quality
-                    thrust_variance = np.var(motor_thrusts)
-                    thrust_mean = np.mean(motor_thrusts)
-                    thrust_cv = thrust_variance / \
-                        (thrust_mean + 1e-6)  # Coefficient of variation
+        #         if len(motor_thrusts) == 6 and self.min_thrust_threshold < total_thrust < self.max_thrust_threshold:
+        #             # Check thrust distribution quality
+        #             thrust_variance = np.var(motor_thrusts)
+        #             thrust_mean = np.mean(motor_thrusts)
+        #             thrust_cv = thrust_variance / \
+        #                 (thrust_mean + 1e-6)  # Coefficient of variation
 
-                    # Quality metric based on thrust consistency and magnitude
-                    control_quality = min(
-                        1.0, total_thrust / 20.0) * max(0.1, 1.0 - thrust_cv)
+        #             # Quality metric based on thrust consistency and magnitude
+        #             control_quality = min(
+        #                 1.0, total_thrust / 20.0) * max(0.1, 1.0 - thrust_cv)
 
-                    accel_physics = self.dynamics.predict_acceleration_from_motor_thrusts(
-                        motor_thrusts, R_bn)
-                    self.prediction_mode = "MOTOR_THRUSTS"
+        #             accel_physics = self.dynamics.predict_acceleration_from_motor_thrusts(
+        #                 motor_thrusts, R_bn)
+        #             self.prediction_mode = "MOTOR_THRUSTS"
 
-            # Priority 2: Control thrust vector
-            elif 'thrust_sp' in control_data and control_data['thrust_sp'] is not None:
-                thrust_sp = control_data['thrust_sp']
-                thrust_magnitude = np.linalg.norm(thrust_sp)
+        #     # Priority 2: Control thrust vector
+        #     elif 'thrust_sp' in control_data and control_data['thrust_sp'] is not None:
+        #         thrust_sp = control_data['thrust_sp']
+        #         thrust_magnitude = np.linalg.norm(thrust_sp)
 
-                if thrust_magnitude > self.min_thrust_threshold:
-                    # Slightly lower quality
-                    control_quality = min(1.0, thrust_magnitude / 20.0) * 0.8
+        #         if thrust_magnitude > self.min_thrust_threshold:
+        #             # Slightly lower quality
+        #             control_quality = min(1.0, thrust_magnitude / 20.0) * 0.8
 
-                    accel_physics = self.dynamics.predict_acceleration_from_thrust_vector(
-                        thrust_sp, R_bn)
-                    self.prediction_mode = "THRUST_VECTOR"
+        #             accel_physics = self.dynamics.predict_acceleration_from_thrust_vector(
+        #                 thrust_sp, R_bn)
+        #             self.prediction_mode = "THRUST_VECTOR"
 
-            # Priority 3: Total thrust (assume vertical)
-            elif 'total_thrust' in control_data and control_data['total_thrust'] is not None:
-                total_thrust = control_data['total_thrust']
+        #     # Priority 3: Total thrust (assume vertical)
+        #     elif 'total_thrust' in control_data and control_data['total_thrust'] is not None:
+        #         total_thrust = control_data['total_thrust']
 
-                if self.min_thrust_threshold < total_thrust < self.max_thrust_threshold:
-                    control_quality = min(
-                        1.0, total_thrust / 20.0) * 0.6  # Lower quality
+        #         if self.min_thrust_threshold < total_thrust < self.max_thrust_threshold:
+        #             control_quality = min(
+        #                 1.0, total_thrust / 20.0) * 0.6  # Lower quality
 
-                    # Vertical thrust assumption
-                    thrust_body = np.array([0, 0, -total_thrust])
-                    accel_physics = self.dynamics.predict_acceleration_from_thrust_vector(
-                        thrust_body, R_bn)
-                    self.prediction_mode = "TOTAL_THRUST"
+        #             # Vertical thrust assumption
+        #             thrust_body = np.array([0, 0, -total_thrust])
+        #             accel_physics = self.dynamics.predict_acceleration_from_thrust_vector(
+        #                 thrust_body, R_bn)
+        #             self.prediction_mode = "TOTAL_THRUST"
 
         # === STEP 4: IMU-BASED ACCELERATION (BASELINE) ===
         accel_imu = R_bn @ accel_corrected + self.g_ned
 
-        # === STEP 5: SENSOR FUSION ===
-        if accel_physics is not None and control_quality > 0.1:
-            # Adaptive fusion based on control quality
-            alpha = self.control_trust_factor * control_quality
-            accel_fused = alpha * accel_physics + (1 - alpha) * accel_imu
-            self.control_available = True
-            self.control_quality = control_quality
-        else:
-            # Fallback to IMU-only prediction
-            accel_fused = accel_imu
-            self.prediction_mode = "IMU_ONLY"
-            self.control_available = False
-            self.control_quality = 0.0
-
         # === STEP 6: KINEMATIC INTEGRATION ===
         # Position and velocity integration
-        vel_mid = vel + 0.5 * accel_fused * self.dt  # Midpoint integration
+        vel_mid = vel + 0.5 * accel_imu * self.dt  # Midpoint integration
         pos_new = pos + vel_mid * self.dt
-        vel_new = vel + accel_fused * self.dt
+        vel_new = vel + accel_imu * self.dt
 
         # === STEP 7: ATTITUDE INTEGRATION ===
         omega_norm = np.linalg.norm(gyro_corrected)
@@ -299,7 +286,8 @@ def run_ekf_with_control_data(csv_file_path, use_magnetometer=True, magnetic_dec
         return None
 
     # === STEP 4: CALCULATE ERRORS AND STATISTICS ===
-    error_stats = calculate_error_statistics(results, data)
+    # MODIFIED: RMSE calculation now starts from 5 seconds
+    error_stats = calculate_error_statistics(results, data, start_time=5.0)
     print_performance_summary(error_stats, results)
 
     print("✅ EKF with control input processing completed!")
@@ -583,52 +571,59 @@ def store_results(results, row, state):
     results['control_quality'].append(state.get('control_quality', 0.0))
 
 
-def calculate_error_statistics(results, data):
-    """Calculate error statistics vs ground truth"""
+def calculate_error_statistics(results, data, start_time=0.0):
+    """
+    Calculate error statistics vs ground truth.
+    RMSE calculation starts from the specified start_time.
+    """
+    print(f"\nCalculating RMSE starting from {start_time} seconds...")
+
     # Convert results to numpy arrays
-    for key in ['position', 'velocity', 'attitude', 'acc_bias', 'gyro_bias', 'pos_std', 'vel_std', 'att_std']:
+    for key in ['position', 'velocity', 'attitude', 'acc_bias', 'gyro_bias']:
         results[key] = np.array(results[key])
+    results['timestamp'] = np.array(results['timestamp'])
 
-    # Find matching ground truth data
+    # --- MODIFICATION: Filter data to start from start_time ---
+    time_mask = results['timestamp'] >= start_time
+    filtered_results = {}
+    for key, value in results.items():
+        if isinstance(value, list):  # handles prediction_modes
+            filtered_results[key] = [item for i,
+                                     item in enumerate(value) if time_mask[i]]
+        elif value.ndim > 0:  # handles numpy arrays
+            filtered_results[key] = value[time_mask]
+
+    filtered_data = data[data['timestamp'] >= start_time].copy()
+    if len(filtered_results['timestamp']) == 0 or len(filtered_data) == 0:
+        print("⚠️ Warning: No data available for RMSE calculation after the start time.")
+        return {'pos_rmse': np.zeros(3), 'vel_rmse': np.zeros(3), 'att_rmse': np.zeros(3), 'valid_samples': 0}
+    # --- END MODIFICATION ---
+
+    # Find matching ground truth data using filtered data
     valid_indices = []
-    result_timestamps = np.array(results['timestamp'])
+    result_timestamps = filtered_results['timestamp']
 
-    for i, t in enumerate(data['timestamp']):
-        if t in result_timestamps:
-            # Validate ground truth data
-            row = data.iloc[i]
-            true_pos = np.array(
-                [row['true_pos_x'], row['true_pos_y'], row['true_pos_z']])
-            true_att = np.array(
-                [row['true_roll'], row['true_pitch'], row['true_yaw']])
-
-            if (not np.allclose(true_pos, 0, atol=1e-6) and
-                    not np.allclose(true_att, 0, atol=1e-6)):
-                valid_indices.append(i)
+    for i in filtered_data.index:
+        row = filtered_data.loc[i]
+        true_pos = np.array(
+            [row['true_pos_x'], row['true_pos_y'], row['true_pos_z']])
+        if not np.allclose(true_pos, 0, atol=1e-6):
+            valid_indices.append(i)
 
     if len(valid_indices) < 50:
         print(
-            f"⚠️  Warning: Only {len(valid_indices)} valid ground truth samples")
+            f"⚠️  Warning: Only {len(valid_indices)} valid ground truth samples after {start_time}s.")
 
     # Extract ground truth
-    true_pos = np.column_stack([
-        data.iloc[valid_indices]['true_pos_x'],
-        data.iloc[valid_indices]['true_pos_y'],
-        data.iloc[valid_indices]['true_pos_z']
-    ])
-    true_vel = np.column_stack([
-        data.iloc[valid_indices]['true_vel_x'],
-        data.iloc[valid_indices]['true_vel_y'],
-        data.iloc[valid_indices]['true_vel_z']
-    ])
-    true_att = np.column_stack([
-        data.iloc[valid_indices]['true_roll'],
-        data.iloc[valid_indices]['true_pitch'],
-        data.iloc[valid_indices]['true_yaw']
-    ])
+    true_pos = filtered_data.loc[valid_indices, [
+        'true_pos_x', 'true_pos_y', 'true_pos_z']].values
+    true_vel = filtered_data.loc[valid_indices, [
+        'true_vel_x', 'true_vel_y', 'true_vel_z']].values
+    true_att = filtered_data.loc[valid_indices, [
+        'true_roll', 'true_pitch', 'true_yaw']].values
 
     # Align EKF results with ground truth
-    gt_timestamps = data.iloc[valid_indices]['timestamp'].values
+    gt_timestamps = filtered_data.loc[valid_indices, 'timestamp'].values
     matching_indices = []
 
     for gt_time in gt_timestamps:
@@ -637,11 +632,11 @@ def calculate_error_statistics(results, data):
             matching_indices.append(result_idx)
 
     # Calculate errors
-    pos_error = results['position'][matching_indices] - \
+    pos_error = filtered_results['position'][matching_indices] - \
         true_pos[:len(matching_indices)]
-    vel_error = results['velocity'][matching_indices] - \
+    vel_error = filtered_results['velocity'][matching_indices] - \
         true_vel[:len(matching_indices)]
-    att_error = results['attitude'][matching_indices] - \
+    att_error = filtered_results['attitude'][matching_indices] - \
         true_att[:len(matching_indices)]
 
     # Handle angle wrapping
@@ -666,7 +661,8 @@ def print_performance_summary(error_stats, results):
     vel_rmse = error_stats['vel_rmse']
     att_rmse = error_stats['att_rmse']
 
-    print(f"\n🎯 PERFORMANCE SUMMARY (Control Input Enhanced)")
+    print(
+        f"\n🎯 PERFORMANCE SUMMARY (Control Input Enhanced, from t={error_stats.get('start_time', 5.0)}s)")
     print("="*60)
 
     print(
@@ -683,9 +679,14 @@ def print_performance_summary(error_stats, results):
     # Control input analysis
     if 'control_quality' in results:
         control_quality = np.array(results['control_quality'])
-        avg_quality = np.mean(control_quality[control_quality > 0])
         control_usage = np.sum(control_quality > 0.1) / \
-            len(control_quality) * 100
+            len(control_quality) * 100 if len(control_quality) > 0 else 0
+
+        # Check if there are any quality values > 0 to avoid mean of empty slice warning
+        if np.any(control_quality > 0):
+            avg_quality = np.mean(control_quality[control_quality > 0])
+        else:
+            avg_quality = 0.0
 
         print(f"\n🎮 Control Input Analysis:")
         print(f"   Average control quality: {avg_quality:.3f}")
@@ -693,36 +694,208 @@ def print_performance_summary(error_stats, results):
 
     # Prediction mode distribution
     modes = results['prediction_modes']
-    mode_counts = {}
-    for mode in modes:
-        mode_counts[mode] = mode_counts.get(mode, 0) + 1
+    if len(modes) > 0:
+        mode_counts = {}
+        for mode in modes:
+            mode_counts[mode] = mode_counts.get(mode, 0) + 1
 
-    print(f"\n🔄 Prediction Mode Distribution:")
-    for mode, count in mode_counts.items():
-        percentage = 100 * count / len(modes)
-        print(f"   {mode}: {count} samples ({percentage:.1f}%)")
+        print(f"\n🔄 Prediction Mode Distribution:")
+        for mode, count in mode_counts.items():
+            percentage = 100 * count / len(modes)
+            print(f"   {mode}: {count} samples ({percentage:.1f}%)")
 
     print("="*60)
 
 
+def plot_results(results, data, start_time=5.0):
+    """
+    Plot EKF estimation vs ground truth, starting from a specific time.
+    This version does NOT plot raw sensor data.
+
+    Args:
+        results (dict): Dictionary containing EKF results.
+        data (pd.DataFrame): DataFrame containing raw simulation and ground truth data.
+        start_time (float): The time in seconds from which to start plotting.
+    """
+    print(f"\n📈 Generating plots starting from {start_time} seconds...")
+
+    # --- MODIFICATION: Filter data based on start_time ---
+    ekf_time = np.array(results['timestamp'])
+    ekf_mask = ekf_time >= start_time
+
+    gt_time = data['timestamp'].values
+    gt_mask = gt_time >= start_time
+
+    if not np.any(ekf_mask) or not np.any(gt_mask):
+        print("⚠️ No data to plot after the specified start time.")
+        return
+
+    # --- END MODIFICATION ---
+
+    # --- POSITION PLOT ---
+    fig1, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
+    fig1.suptitle(
+        f'Position Estimation vs. Ground Truth (from t={start_time}s)', fontsize=16)
+
+    # Position X (North)
+    ax1.plot(gt_time[gt_mask], data['true_pos_x'][gt_mask],
+             'k-', label='Ground Truth', linewidth=2)
+    ax1.plot(ekf_time[ekf_mask], results['position']
+             [ekf_mask, 0], 'b-', label='EKF Estimate', linewidth=1.5)
+    ax1.set_ylabel('North (m)')
+    ax1.legend()
+    ax1.grid(True)
+
+    # Position Y (East)
+    ax2.plot(gt_time[gt_mask], data['true_pos_y'][gt_mask],
+             'k-', label='Ground Truth', linewidth=2)
+    ax2.plot(ekf_time[ekf_mask], results['position']
+             [ekf_mask, 1], 'b-', label='EKF Estimate', linewidth=1.5)
+    ax2.set_ylabel('East (m)')
+    ax2.legend()
+    ax2.grid(True)
+
+    # Position Z (Down)
+    ax3.plot(gt_time[gt_mask], data['true_pos_z'][gt_mask],
+             'k-', label='Ground Truth', linewidth=2)
+    ax3.plot(ekf_time[ekf_mask], results['position']
+             [ekf_mask, 2], 'b-', label='EKF Estimate', linewidth=1.5)
+    ax3.set_ylabel('Down (m)')
+    ax3.set_xlabel('Time (s)')
+    ax3.legend()
+    ax3.grid(True)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    # --- VELOCITY PLOT ---
+    fig2, (ax4, ax5, ax6) = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
+    fig2.suptitle(
+        f'Velocity Estimation vs. Ground Truth (from t={start_time}s)', fontsize=16)
+
+    # Velocity X (North)
+    ax4.plot(gt_time[gt_mask], data['true_vel_x'][gt_mask],
+             'k-', label='Ground Truth', linewidth=2)
+    ax4.plot(ekf_time[ekf_mask], results['velocity']
+             [ekf_mask, 0], 'b-', label='EKF Estimate', linewidth=1.5)
+    ax4.set_ylabel('V_north (m/s)')
+    ax4.legend()
+    ax4.grid(True)
+
+    # Velocity Y (East)
+    ax5.plot(gt_time[gt_mask], data['true_vel_y'][gt_mask],
+             'k-', label='Ground Truth', linewidth=2)
+    ax5.plot(ekf_time[ekf_mask], results['velocity']
+             [ekf_mask, 1], 'b-', label='EKF Estimate', linewidth=1.5)
+    ax5.set_ylabel('V_east (m/s)')
+    ax5.legend()
+    ax5.grid(True)
+
+    # Velocity Z (Down)
+    ax6.plot(gt_time[gt_mask], data['true_vel_z'][gt_mask],
+             'k-', label='Ground Truth', linewidth=2)
+    ax6.plot(ekf_time[ekf_mask], results['velocity']
+             [ekf_mask, 2], 'b-', label='EKF Estimate', linewidth=1.5)
+    ax6.set_ylabel('V_down (m/s)')
+    ax6.set_xlabel('Time (s)')
+    ax6.legend()
+    ax6.grid(True)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    # --- ATTITUDE PLOT ---
+    fig3, (ax7, ax8, ax9) = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
+    fig3.suptitle(
+        f'Attitude Estimation vs. Ground Truth (from t={start_time}s)', fontsize=16)
+
+    # Attitude (Roll)
+    ax7.plot(gt_time[gt_mask], np.rad2deg(data['true_roll']
+             [gt_mask]), 'k-', label='Ground Truth', linewidth=2)
+    ax7.plot(ekf_time[ekf_mask], np.rad2deg(results['attitude']
+             [ekf_mask, 0]), 'b-', label='EKF Estimate', linewidth=1.5)
+    ax7.set_ylabel('Roll (deg)')
+    ax7.legend()
+    ax7.grid(True)
+
+    # Attitude (Pitch)
+    ax8.plot(gt_time[gt_mask], np.rad2deg(data['true_pitch']
+             [gt_mask]), 'k-', label='Ground Truth', linewidth=2)
+    ax8.plot(ekf_time[ekf_mask], np.rad2deg(results['attitude']
+             [ekf_mask, 1]), 'b-', label='EKF Estimate', linewidth=1.5)
+    ax8.set_ylabel('Pitch (deg)')
+    ax8.legend()
+    ax8.grid(True)
+
+    # Attitude (Yaw)
+    ax9.plot(gt_time[gt_mask], np.rad2deg(data['true_yaw']
+             [gt_mask]), 'k-', label='Ground Truth', linewidth=2)
+    ax9.plot(ekf_time[ekf_mask], np.rad2deg(results['attitude']
+             [ekf_mask, 2]), 'b-', label='EKF Estimate', linewidth=1.5)
+    ax9.set_ylabel('Yaw (deg)')
+    ax9.set_xlabel('Time (s)')
+    ax9.legend()
+    ax9.grid(True)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    # --- SENSOR BIAS PLOT ---
+    fig4, (ax10, ax11) = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
+    fig4.suptitle(
+        f'Sensor Bias Estimation (from t={start_time}s)', fontsize=16)
+
+    # Accelerometer Bias
+    ax10.plot(ekf_time[ekf_mask], results['acc_bias']
+              [ekf_mask, 0], label='ax bias')
+    ax10.plot(ekf_time[ekf_mask], results['acc_bias']
+              [ekf_mask, 1], label='ay bias')
+    ax10.plot(ekf_time[ekf_mask], results['acc_bias']
+              [ekf_mask, 2], label='az bias')
+    ax10.set_ylabel('Accelerometer Bias (m/s²)')
+    ax10.legend()
+    ax10.grid(True)
+
+    # Gyroscope Bias
+    ax11.plot(ekf_time[ekf_mask], np.rad2deg(
+        results['gyro_bias'][ekf_mask, 0]), label='gx bias')
+    ax11.plot(ekf_time[ekf_mask], np.rad2deg(
+        results['gyro_bias'][ekf_mask, 1]), label='gy bias')
+    ax11.plot(ekf_time[ekf_mask], np.rad2deg(
+        results['gyro_bias'][ekf_mask, 2]), label='gz bias')
+    ax11.set_ylabel('Gyroscope Bias (deg/s)')
+    ax11.set_xlabel('Time (s)')
+    ax11.legend()
+    ax11.grid(True)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    plt.show()
+
+
 if __name__ == "__main__":
     # Example usage
-    csv_file_path = "logs/complete_flight_data_with_geodetic_20250530_183803.csv"
+    # Ganti dengan path file CSV Anda yang sebenarnya
+    csv_file_path = "logs/angka_8_20250619_043832.csv"
 
     try:
+        # Jalankan EKF
         results = run_ekf_with_control_data(
             csv_file_path,
             use_magnetometer=True,
-            magnetic_declination=0.5  # Surabaya
+            magnetic_declination=0.5  # Perkiraan untuk Surabaya
         )
 
         if results is not None:
-            ekf, results_data, data = results
+            ekf, results_data, raw_data = results
             print("✅ EKF with control input completed successfully!")
+
+            # Panggil fungsi plotting dengan start_time=5.0
+            plot_results(results_data, raw_data, start_time=5.0)
         else:
             print("❌ EKF processing failed!")
 
+    except FileNotFoundError:
+        print(f"❌ Error: File not found at '{csv_file_path}'")
+        print("Please ensure the CSV file exists and the path is correct.")
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
+        print(f"❌ An unexpected error occurred: {str(e)}")
         import traceback
         traceback.print_exc()
