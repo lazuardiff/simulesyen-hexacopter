@@ -47,3 +47,6 @@ Thumbs.db
 Simulation/logs/
 Simulation/ekf results/
 Simulation/ekf_comparison_results/
+Simulation/ekf_results/
+Simulation/mission_analysis_plots/
+Simulation/plots/
