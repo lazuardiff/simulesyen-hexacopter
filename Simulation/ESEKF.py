@@ -216,6 +216,10 @@ def process_all_data(ekf, data, use_magnetometer):
             continue
 
         # === TAHAP KOREKSI (MEASUREMENT UPDATES) ===
+        if 'accel_updates' not in stats:
+            stats['accel_updates'] = 0
+        stats['accel_updates'] += ekf.update_accelerometer_for_attitude(
+            accel_body, gyro_body)
         stats['gps_updates'] += update_gps_measurements(ekf, row)
         stats['baro_updates'] += update_barometer_measurement(ekf, row)
         if use_magnetometer:
@@ -234,6 +238,8 @@ def process_all_data(ekf, data, use_magnetometer):
     # Cetak statistik pemrosesan
     print("\n📊 Statistik Pemrosesan:")
     print(f"  ✅ Prediksi valid: {stats['prediction_count']}")
+    if 'accel_updates' in stats:
+        print(f"  📏 Update Akselerometer (Attitude): {stats['accel_updates']}")
     print(f"  📡 Update GPS: {stats['gps_updates']}")
     print(f"  🌡️  Update Barometer: {stats['baro_updates']}")
     print(f"  🧭 Update Magnetometer: {stats['mag_updates']}")
@@ -708,12 +714,11 @@ if __name__ == "__main__":
         results = run_esekf(
             csv_file_path,
             use_magnetometer=True,
-            magnetic_declination=0.85  # Deklinasi untuk Surabaya
+            magnetic_declination=0.5  # Deklinasi untuk Surabaya
         )
 
         if results is not None:
             ekf, results_data, raw_data = results
-            print("✅ Pemrosesan ESEKF berhasil diselesaikan!")
 
             # Simpan hasil ke CSV
             # save_ekf_results(results_data, raw_data) # Aktifkan jika perlu

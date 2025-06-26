@@ -23,106 +23,88 @@ class BaseESEKF:
     def __init__(self, dt=0.01):
         self.dt = dt
 
-        # --- UKURAN STATE VECTOR ---
-        self.state_dim = 19
+        # --- KEMBALIKAN UKURAN STATE VECTOR KE SEMULA ---
+        self.state_dim = 16  # Kembali ke 16 (tanpa g)
         self.x = np.zeros(self.state_dim)
-        self.x[6] = 1.0
-        self.x[16:19] = np.array([0, 0, 9.81])
-        self.error_state_dim = 18
+        self.x[6] = 1.0  # Inisialisasi quaternion
 
-        # --- MATRIKS KOVARIANS & NOISE ---
-        self.P = np.eye(self.error_state_dim)
+        self.error_state_dim = 15  # Kembali ke 15 (tanpa δg)
+
+        # --- KEMBALIKAN MATRIKS KOVARIANS & NOISE KE UKURAN SEMULA ---
+        self.P = np.eye(self.error_state_dim)  # 15x15
         self.P[0:3, 0:3] *= 25.0
         self.P[3:6, 3:6] *= 4.0
-        self.P[6:9, 6:9] = np.diag([0.1**2, 0.1**2, 0.2**2])
+        # Gunakan tuning P yang sudah baik dari hasil sebelumnya
+        self.P[6:9, 6:9] = np.diag([0.04**2, 0.04**2, 0.1**2])
         self.P[9:12, 9:12] *= 0.005
         self.P[12:15, 12:15] *= 0.005
-        self.P[15:18, 15:18] = np.eye(3) * (0.1)**2
 
+        # Matriks Q kembali ke ukuran 15x15
         self.Q = np.zeros((self.error_state_dim, self.error_state_dim))
+        # Gunakan nilai tuning Q yang sudah baik
         vel_noise_psd = 0.1
-        att_noise_psd = 0.02
-        acc_bias_psd = 2e-4
-        gyro_bias_psd = 2e-5
+        att_noise_psd = 0.001
+        acc_bias_psd = 1e-5
+        gyro_bias_psd = 3e-5
         self.Q[3:6, 3:6] = np.eye(3) * (vel_noise_psd**2) * self.dt
         self.Q[6:9, 6:9] = np.eye(3) * (att_noise_psd**2) * self.dt
         self.Q[9:12, 9:12] = np.eye(3) * (acc_bias_psd**2) * self.dt
         self.Q[12:15, 12:15] = np.eye(3) * (gyro_bias_psd**2) * self.dt
 
+        self.R_accel = np.eye(3) * 1.1**2
         self.R_gps_pos = np.eye(3) * 1.0**2
-        self.R_gps_vel = np.eye(3) * 0.25**2
+        self.R_gps_vel = np.eye(3) * (0.1**2)
         self.R_baro = np.array([[0.5**2]])
         self.R_mag = np.eye(3) * 0.02**2
 
-        # --- TAMBAHKAN KEMBALI PARAMETER YANG HILANG ---
-        # Parameter untuk tuning YAW dan Magnetometer
+        # --- DEFINISIKAN KEMBALI g SEBAGAI KONSTANTA ---
+        self.g_ned = np.array([0, 0, 9.81])
+
+        # Parameter tuning lainnya tetap sama
         self.yaw_innovation_gate = 8.0
-        self.mag_declination = 0.5  # Akan di-override oleh nilai dari run_esekf
-
-        # Parameter untuk Magnetometer Bias Learning
-        self.enable_mag_bias_learning = True  # <-- ATRIBUT YANG HILANG
-        self.mag_bias = np.zeros(3)           # <-- ATRIBUT YANG HILANG
-
-        # Parameter untuk GPS Heading Assistance
+        self.mag_declination = 0.5
+        self.enable_mag_bias_learning = True
+        self.mag_bias = np.zeros(3)
         self.use_gps_heading = True
         self.gps_heading_threshold = 1.0
         self.gps_heading_weight_max = 0.6
-        # --- AKHIR DARI PENAMBAHAN ---
 
-        # Referensi medan magnet (sebelumnya sudah ada, pastikan tetap ada)
         self.mag_ref_ned = np.array(
             [np.cos(np.deg2rad(0.5)), np.sin(np.deg2rad(0.5)), 0.0])
-
         self.initialized = False
         self.prediction_mode = "IMU_ONLY"
 
     def predict(self, accel_body, gyro_body):
-        """
-        Tahap Prediksi ESEKF dengan estimasi gravitasi.
-        """
         if not self.initialized:
             return
 
-        # --- PERUBAHAN 3: MENGGUNAKAN g DARI STATE ---
+        # Ambil state, tanpa g
         pos = self.x[0:3]
         vel = self.x[3:6]
         q = self.x[6:10]
         acc_bias = self.x[10:13]
         gyro_bias = self.x[13:16]
-        g = self.x[16:19]  # Ambil g dari state, bukan sebagai konstanta
+        # g tidak lagi diambil dari state
 
         accel_corrected = accel_body - acc_bias
         gyro_corrected = gyro_body - gyro_bias
         R_bn = self.quaternion_to_rotation_matrix(q)
 
-        # Integrasi Kinematika Status Nominal (Eq. 260)
-        # Akselerasi dalam frame NED sekarang menggunakan g dari state
-        accel_ned = R_bn @ accel_corrected + g
+        # Gunakan g sebagai konstanta
+        accel_ned = R_bn @ accel_corrected + self.g_ned
         pos_new = pos + vel * self.dt + 0.5 * accel_ned * self.dt**2
         vel_new = vel + accel_ned * self.dt
 
-        # Integrasi quaternion
+        # Integrasi quaternion (tidak ada perubahan)
         omega_norm = np.linalg.norm(gyro_corrected)
         if omega_norm > 1e-8:
-            # Rodrigues rotation formula for quaternion integration
             axis = gyro_corrected / omega_norm
             angle = omega_norm * self.dt
-
-            # Quaternion increment
-            dq = np.array([
-                np.cos(angle/2),
-                axis[0] * np.sin(angle/2),
-                axis[1] * np.sin(angle/2),
-                axis[2] * np.sin(angle/2)
-            ])
-
-            # Quaternion multiplication: q_new = q * dq
-            q_new = np.array([
-                q[0]*dq[0] - q[1]*dq[1] - q[2]*dq[2] - q[3]*dq[3],
-                q[0]*dq[1] + q[1]*dq[0] + q[2]*dq[3] - q[3]*dq[2],
-                q[0]*dq[2] - q[1]*dq[3] + q[2]*dq[0] + q[3]*dq[1],
-                q[0]*dq[3] + q[1]*dq[2] - q[2]*dq[1] + q[3]*dq[0]
-            ])
+            dq = np.array([np.cos(angle/2),
+                           axis[0] * np.sin(angle/2),
+                           axis[1] * np.sin(angle/2),
+                           axis[2] * np.sin(angle/2)])
+            q_new = self.quaternion_multiply(q, dq)
         else:
             q_new = q.copy()
 
@@ -130,32 +112,21 @@ class BaseESEKF:
         self.x[0:3] = pos_new
         self.x[3:6] = vel_new
         self.x[6:10] = self.normalize_quaternion(q_new)
-        # self.x[16:19] tidak berubah karena ġ = 0
 
-        # --- PERUBAHAN 4: MEMPERBESAR MATRIKS JACOBIAN F ---
-        F = np.eye(self.error_state_dim)  # Sekarang 18x18
+        # Matriks Jacobian F kembali ke ukuran 15x15
+        F = np.eye(self.error_state_dim)
 
-        # Propagasi error posisi dari error kecepatan
         F[0:3, 3:6] = np.eye(3) * self.dt
-
-        # Propagasi error kecepatan
-        F[3:6, 6:9] = - \
-            R_bn @ self.skew_symmetric(accel_corrected) * self.dt  # dari δθ
-        # dari δa_b
+        F[3:6, 6:9] = -R_bn @ self.skew_symmetric(accel_corrected) * self.dt
         F[3:6, 9:12] = -R_bn * self.dt
-        # BLOK BARU: Propagasi error kecepatan dari error gravitasi (Eq. 261b -> +δg)
-        # dari δg
-        F[3:6, 15:18] = np.eye(3) * self.dt
+        # HAPUS BLOK UNTUK δg
 
-        # Propagasi error attitude
         delta_rot_vec = gyro_corrected * self.dt
         R_delta = Rotation.from_rotvec(delta_rot_vec).as_matrix()
-        # dari δθ
         F[6:9, 6:9] = R_delta.T
-        # dari δω_b
         F[6:9, 12:15] = -np.eye(3) * self.dt
 
-        # Propagasi Kovariansi (Eq. 269)
+        # Propagasi Kovariansi
         self.P = F @ self.P @ F.T + self.Q
         self.P = 0.5 * (self.P + self.P.T)
         self.P += np.eye(self.error_state_dim) * 1e-12
@@ -223,7 +194,6 @@ class BaseESEKF:
 
         self.x[10:13] += delta_x[9:12]  # Bias Akselerometer
         self.x[13:16] += delta_x[12:15]  # Bias Giroskop
-        self.x[16:19] += delta_x[15:18]  # Vektor Gravitasi
 
         # Reset ESEKF (δx ← 0) secara implisit.
         # Kovariansi P sudah diupdate, dan mean error state (δx) kembali dianggap nol.
@@ -325,6 +295,65 @@ class BaseESEKF:
         if initial_mag is not None:
             print(f"  Magnetometer norm: {np.linalg.norm(initial_mag):.3f}")
         print(f"  GPS velocity norm: {np.linalg.norm(gps_vel):.3f} m/s")
+
+    def update_accelerometer_for_attitude(self, accel_body, gyro_body):
+        """
+        Tahap Koreksi untuk orientasi (roll & pitch) menggunakan akselerometer.
+        Konsep ini diadaptasi dari jurnal, diimplementasikan dalam kerangka ES-EKF.
+        Update ini hanya aktif saat UAV bergerak dengan akselerasi rendah.
+        """
+        if not self.initialized:
+            return 0
+
+        # --- KONDISI AKTIVASI ---
+        # 1. Cek apakah akselerasi mendekati 1g (tidak ada akselerasi linear besar)
+        acc_norm = np.linalg.norm(accel_body)
+        if not (0.9 * 9.81 < acc_norm < 1.1 * 9.81):
+            return 0  # Tidak aktif jika ada akselerasi linear yang signifikan
+
+        # 2. Cek apakah rotasi rendah (untuk memastikan akselerometer tidak terpengaruh gaya sentripetal)
+        # Gunakan gyro yang sudah dikoreksi bias
+        gyro_corrected = gyro_body - self.x[13:16]
+        if np.linalg.norm(gyro_corrected) > np.deg2rad(15.0):  # Batas 15 deg/s
+            return 0
+
+        # --- 1. Hitung Inovasi ---
+        # Prediksi arah gravitasi di body frame berdasarkan orientasi saat ini
+        q_nominal = self.x[6:10]
+        R_bn = self.quaternion_to_rotation_matrix(q_nominal)
+        gravity_expected_body = R_bn.T @ self.g_ned  # g_ned dari NED ke Body
+
+        # Inovasi adalah selisih antara pengukuran akselerometer dan prediksi gravitasi
+        # Kita normalisasi keduanya agar fokus pada arah, bukan magnitudo
+        innovation = (accel_body / acc_norm) - \
+            (gravity_expected_body / np.linalg.norm(gravity_expected_body))
+
+        # --- 2. Hitung Jacobian Pengukuran (H) ---
+        # H = ∂h/∂δx, di mana h(δx) = (R_nominal @ R(δθ))^T @ g_ned
+        # ∂h/∂δθ = [ (R_bn.T @ g_ned) x ] = [ gravity_expected_body x ]
+        H = np.zeros((3, self.error_state_dim))
+        # Turunan terhadap error attitude (δθ)
+        H[0:3, 6:9] = self.skew_symmetric(gravity_expected_body)
+
+        # --- 3. Hitung Kalman Gain (K) ---
+        S = H @ self.P @ H.T + self.R_accel
+        try:
+            S_inv = np.linalg.pinv(S)
+        except np.linalg.LinAlgError:
+            return 0
+        K = self.P @ H.T @ S_inv
+
+        # --- 4. Update Error State & Kovariansi ---
+        delta_x_correction = K @ innovation
+
+        I = np.eye(self.error_state_dim)
+        self.P = (I - K @ H) @ self.P @ (I - K @ H).T + K @ self.R_accel @ K.T
+        self.P = 0.5 * (self.P + self.P.T)
+
+        # --- 5. Injeksi Error ke State Nominal & Reset ESEKF ---
+        self._inject_error_and_reset(delta_x_correction)
+
+        return 1
 
     def update_gps_position(self, gps_pos):
         """
