@@ -5,14 +5,6 @@ from scipy.spatial.transform import Rotation
 
 class BaseESEKF:
     """
-    Base Extended Kalman Filter class for attitude and position estimation
-
-    State vector: [px, py, pz, vx, vy, vz, qw, qx, qy, qz, bias_ax, bias_ay, bias_az, bias_gx, bias_gy, bias_gz]
-    """
-
-
-class BaseESEKF:
-    """
     Base Error-State EKF dengan estimasi vektor gravitasi.
     Sesuai dengan model lengkap di Bab 5 paper Solà.
 
@@ -78,50 +70,57 @@ class BaseESEKF:
         if not self.initialized:
             return
 
-        # Ambil state, tanpa g
-        pos = self.x[0:3]
-        vel = self.x[3:6]
-        q = self.x[6:10]
-        acc_bias = self.x[10:13]
-        gyro_bias = self.x[13:16]
-        # g tidak lagi diambil dari state
+        # --- PREDIKSI NOMINAL STATE MENGGUNAKAN RK4 ---
+        # RK4 membutuhkan 4 evaluasi turunan (slope)
 
-        accel_corrected = accel_body - acc_bias
-        gyro_corrected = gyro_body - gyro_bias
-        R_bn = self.quaternion_to_rotation_matrix(q)
+        # k1 dihitung pada state awal
+        k1 = self._nominal_state_dynamics(self.x, accel_body, gyro_body)
 
-        # Gunakan g sebagai konstanta
-        accel_ned = R_bn @ accel_corrected + self.g_ned
-        pos_new = pos + vel * self.dt + 0.5 * accel_ned * self.dt**2
-        vel_new = vel + accel_ned * self.dt
+        # k2 dihitung pada state di tengah interval, menggunakan k1
+        k2_state = self.x + 0.5 * self.dt * k1
+        k2_state[6:10] = self.normalize_quaternion(
+            k2_state[6:10])  # Normalisasi kuaternion
+        k2 = self._nominal_state_dynamics(k2_state, accel_body, gyro_body)
 
-        # Integrasi quaternion (tidak ada perubahan)
-        omega_norm = np.linalg.norm(gyro_corrected)
-        if omega_norm > 1e-8:
-            axis = gyro_corrected / omega_norm
-            angle = omega_norm * self.dt
-            dq = np.array([np.cos(angle/2),
-                           axis[0] * np.sin(angle/2),
-                           axis[1] * np.sin(angle/2),
-                           axis[2] * np.sin(angle/2)])
-            q_new = self.quaternion_multiply(q, dq)
-        else:
-            q_new = q.copy()
+        # k3 dihitung pada state di tengah interval, menggunakan k2
+        k3_state = self.x + 0.5 * self.dt * k2
+        k3_state[6:10] = self.normalize_quaternion(
+            k3_state[6:10])  # Normalisasi kuaternion
+        k3 = self._nominal_state_dynamics(k3_state, accel_body, gyro_body)
+
+        # k4 dihitung pada state di akhir interval, menggunakan k3
+        k4_state = self.x + self.dt * k3
+        k4_state[6:10] = self.normalize_quaternion(
+            k4_state[6:10])  # Normalisasi kuaternion
+        k4 = self._nominal_state_dynamics(k4_state, accel_body, gyro_body)
+
+        # Kombinasikan slope untuk mendapatkan update state
+        state_increment = (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
 
         # Update state nominal
-        self.x[0:3] = pos_new
-        self.x[3:6] = vel_new
-        self.x[6:10] = self.normalize_quaternion(q_new)
+        self.x += state_increment
+        self.x[6:10] = self.normalize_quaternion(
+            self.x[6:10])  # Final normalization
+
+        # --- PREDIKSI KOVARIANS ERROR STATE (TETAP SAMA) ---
+        # Logika untuk menghitung F dan P tidak berubah
+
+        # Kita perlu R_bn dan gyro_corrected dari state *sebelum* update untuk F
+        q_old = self.x - state_increment  # Perkirakan state lama untuk F
+        q_old[6:10] = self.normalize_quaternion(q_old[6:10])
+        R_bn_old = self.quaternion_to_rotation_matrix(q_old[6:10])
+        accel_corrected_old = accel_body - q_old[10:13]
+        gyro_corrected_old = gyro_body - q_old[13:16]
 
         # Matriks Jacobian F kembali ke ukuran 15x15
         F = np.eye(self.error_state_dim)
 
         F[0:3, 3:6] = np.eye(3) * self.dt
-        F[3:6, 6:9] = -R_bn @ self.skew_symmetric(accel_corrected) * self.dt
-        F[3:6, 9:12] = -R_bn * self.dt
-        # HAPUS BLOK UNTUK δg
+        F[3:6, 6:9] = - \
+            R_bn_old @ self.skew_symmetric(accel_corrected_old) * self.dt
+        F[3:6, 9:12] = -R_bn_old * self.dt
 
-        delta_rot_vec = gyro_corrected * self.dt
+        delta_rot_vec = gyro_corrected_old * self.dt
         R_delta = Rotation.from_rotvec(delta_rot_vec).as_matrix()
         F[6:9, 6:9] = R_delta.T
         F[6:9, 12:15] = -np.eye(3) * self.dt
@@ -194,6 +193,7 @@ class BaseESEKF:
 
         self.x[10:13] += delta_x[9:12]  # Bias Akselerometer
         self.x[13:16] += delta_x[12:15]  # Bias Giroskop
+        self.x[16:19] += delta_x[15:18]  # Vektor Gravitasi
 
         # Reset ESEKF (δx ← 0) secara implisit.
         # Kovariansi P sudah diupdate, dan mean error state (δx) kembali dianggap nol.
@@ -295,6 +295,54 @@ class BaseESEKF:
         if initial_mag is not None:
             print(f"  Magnetometer norm: {np.linalg.norm(initial_mag):.3f}")
         print(f"  GPS velocity norm: {np.linalg.norm(gps_vel):.3f} m/s")
+
+    def _nominal_state_dynamics(self, state, accel_body, gyro_body):
+        """
+        Menghitung turunan dari nominal state (ẋ = f(x, u)).
+        Ini adalah fungsi yang akan diintegrasikan oleh RK4.
+
+        Args:
+            state (np.array): Vektor state nominal [p, v, q, ab, ωb] pada suatu waktu.
+            accel_body (np.array): Pengukuran akselerometer mentah.
+            gyro_body (np.array): Pengukuran giroskop mentah.
+
+        Returns:
+            np.array: Turunan state (x_dot).
+        """
+        # Ekstrak state
+        pos = state[0:3]
+        vel = state[3:6]
+        q = state[6:10]
+        acc_bias = state[10:13]
+        gyro_bias = state[13:16]
+
+        # Koreksi pengukuran IMU
+        accel_corrected = accel_body - acc_bias
+        gyro_corrected = gyro_body - gyro_bias
+
+        # --- Hitung turunan state ---
+
+        # 1. Turunan Posisi (p_dot = v)
+        pos_dot = vel
+
+        # 2. Turunan Kecepatan (v_dot = R(a_m - a_b) + g)
+        R_bn = self.quaternion_to_rotation_matrix(q)
+        accel_ned = R_bn @ accel_corrected + self.g_ned
+        vel_dot = accel_ned
+
+        # 3. Turunan Quaternion (q_dot = 1/2 * q ⊗ ω)
+        omega_quat = np.array(
+            [0, gyro_corrected[0], gyro_corrected[1], gyro_corrected[2]])
+        q_dot = 0.5 * self.quaternion_multiply(q, omega_quat)
+
+        # 4. Turunan Bias (diasumsikan random walk, turunannya nol di model nominal)
+        acc_bias_dot = np.zeros(3)
+        gyro_bias_dot = np.zeros(3)
+
+        # Gabungkan semua turunan menjadi satu vektor
+        x_dot = np.concatenate(
+            [pos_dot, vel_dot, q_dot, acc_bias_dot, gyro_bias_dot])
+        return x_dot
 
     def update_accelerometer_for_attitude(self, accel_body, gyro_body):
         """
